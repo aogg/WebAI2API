@@ -181,6 +181,71 @@ export function createAdminRouter(context) {
                 return;
             }
 
+            // ==================== 浏览器池管理 ====================
+
+            // POST /admin/pool/restart - 重启浏览器（全部或指定 Worker 的浏览器实例）
+            if (method === 'POST' && pathname === '/pool/restart') {
+                let workerName = null;
+                try {
+                    const body = await readBody(req);
+                    workerName = body.workerName || null;
+                } catch { /* 无请求体时重启全部 */ }
+
+                const poolContext = queueManager?.getPoolContext?.();
+                const poolManager = poolContext?.poolManager;
+
+                if (!poolManager || !poolManager.initialized) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: '工作池尚未初始化（可能处于安全模式），无法重启浏览器',
+                        status: 503
+                    });
+                    return;
+                }
+
+                logger.info('管理器', `收到浏览器重启请求: ${workerName || '全部浏览器实例'}`);
+
+                try {
+                    const result = await poolManager.restartBrowser(workerName);
+                    if (result.success) {
+                        sendJson(res, 200, {
+                            success: true,
+                            message: `浏览器重启完成 (${result.results.length} 个实例)`,
+                            results: result.results
+                        });
+                    } else {
+                        sendJson(res, 207, {
+                            success: false,
+                            message: '部分浏览器重启失败',
+                            results: result.results
+                        });
+                    }
+                } catch (e) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: `浏览器重启失败: ${e.message}`
+                    });
+                }
+                return;
+            }
+
+            // GET /admin/pool/workers - Worker 运行状态列表
+            if (method === 'GET' && pathname === '/pool/workers') {
+                const poolContext = queueManager?.getPoolContext?.();
+                const poolManager = poolContext?.poolManager;
+
+                if (!poolManager || !poolManager.initialized) {
+                    sendJson(res, 200, { initialized: false, workers: [] });
+                    return;
+                }
+
+                sendJson(res, 200, {
+                    initialized: true,
+                    workers: poolManager.getWorkersStatus()
+                });
+                return;
+            }
+
             // ==================== 缓存与数据管理 ====================
 
             // POST /admin/cache/clear - 清理缓存
@@ -511,9 +576,9 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            // GET /admin/history/media/:filepath - 静态媒体文件服务
+            // GET /admin/history/media/:filepath - 静态媒体文件服务（含 trace 截图子目录）
             if (method === 'GET' && pathname.startsWith('/history/media/')) {
-                const filepath = pathname.replace('/history/media/', '');
+                const filepath = decodeURIComponent(pathname.replace('/history/media/', ''));
                 if (!filepath || filepath.includes('..')) {
                     sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '无效的文件名' });
                     return;
@@ -568,7 +633,7 @@ export function createAdminRouter(context) {
                 let downloadFn = null;
                 try {
                     const poolContext = queueManager?.getPoolContext?.();
-                    const page = poolContext?.getFirstPage?.();
+                    const page = poolContext?.poolManager?.getFirstPage?.();
                     if (page) {
                         const imgDlCfg = config?.backend?.pool?.failover || {};
                         downloadFn = (url) => useContextDownload(url, page, {

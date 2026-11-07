@@ -1,12 +1,16 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue';
 import { useSettingsStore } from '@/stores/settings';
+import { message, Modal } from 'ant-design-vue';
 import {
     DesktopOutlined,
     DisconnectOutlined,
     ExpandOutlined,
     CompressOutlined,
-    ReloadOutlined
+    ReloadOutlined,
+    SyncOutlined,
+    SnippetsOutlined,
+    ClusterOutlined
 } from '@ant-design/icons-vue';
 
 const settingsStore = useSettingsStore();
@@ -17,6 +21,13 @@ const vncStatus = ref(null);
 const connectionState = ref('disconnected'); // disconnected, connecting, connected, error
 const errorMessage = ref('');
 const isFullscreen = ref(false);
+
+// 重启浏览器状态
+const restarting = ref(false);
+
+// 剪贴板状态
+const pasteModalVisible = ref(false);
+const pasteText = ref('');
 
 // DOM 引用
 const vncContainer = ref(null);
@@ -72,6 +83,7 @@ async function connectVnc() {
         // 事件监听
         rfb.addEventListener('connect', () => {
             connectionState.value = 'connected';
+            message.success('VNC 已连接，可直接 Ctrl+V 粘贴或使用"粘贴"按钮');
         });
 
         rfb.addEventListener('disconnect', (e) => {
@@ -84,6 +96,17 @@ async function connectVnc() {
 
         rfb.addEventListener('credentialsrequired', () => {
             rfb.sendCredentials({ password: '' });
+        });
+
+        // 远程剪贴板 → 本地剪贴板（HTTPS 下自动同步）
+        rfb.addEventListener('clipboard', async (e) => {
+            const text = e.detail?.text;
+            if (!text) return;
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch (err) {
+                console.debug('远程剪贴板写入本地失败（需 HTTPS）', err);
+            }
         });
 
     } catch (e) {
@@ -119,14 +142,160 @@ function handleFullscreenChange() {
     isFullscreen.value = !!document.fullscreenElement;
 }
 
+// ============ 剪贴板：本地 → 远程 ============
+
+/**
+ * 把文本发送到远程剪贴板（VNC ClientCutText）
+ */
+function sendToRemoteClipboard(text) {
+    if (!rfb || connectionState.value !== 'connected') {
+        message.warning('请先连接虚拟显示器');
+        return false;
+    }
+    if (!text) {
+        message.warning('剪贴板内容为空');
+        return false;
+    }
+    rfb.clipboardPaste(text);
+    return true;
+}
+
+/**
+ * 粘贴按钮：读取本地剪贴板并注入远程
+ */
+async function pasteToRemote() {
+    if (connectionState.value !== 'connected') {
+        message.warning('请先连接虚拟显示器');
+        return;
+    }
+    try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+            message.info('本地剪贴板为空，可手动粘贴到弹窗中发送');
+            openPasteModal();
+            return;
+        }
+        if (sendToRemoteClipboard(text)) {
+            message.success(`已发送 ${text.length} 个字符到远程剪贴板，在远程系统里 Ctrl+V 即可粘贴`);
+        }
+    } catch (e) {
+        // 剪贴板 API 被拒绝（权限/非安全上下文），回退到手动弹窗
+        console.warn('读取本地剪贴板失败，回退到手动粘贴', e);
+        openPasteModal();
+    }
+}
+
+/**
+ * 打开手动粘贴弹窗
+ */
+function openPasteModal() {
+    pasteText.value = '';
+    pasteModalVisible.value = true;
+}
+
+/**
+ * 手动粘贴弹窗：发送
+ */
+function sendPasteModal() {
+    if (!pasteText.value) {
+        message.warning('请先粘贴内容');
+        return;
+    }
+    if (sendToRemoteClipboard(pasteText.value)) {
+        pasteModalVisible.value = false;
+        message.success(`已发送 ${pasteText.value.length} 个字符到远程剪贴板`);
+    }
+}
+
+// Ctrl+V 直接粘贴：在捕获阶段拦截，避免按键被转发到远程系统
+function handleKeyDown(e) {
+    if (connectionState.value !== 'connected') return;
+    const isPasteKey = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey
+        && (e.key === 'v' || e.key === 'V');
+    if (isPasteKey) {
+        // 只拦截转发，不阻止默认行为（默认行为会触发 paste 事件）
+        e.stopPropagation();
+    }
+}
+
+// paste 事件：从事件对象直接拿剪贴板文本（无需 read 权限）
+function handlePaste(e) {
+    if (connectionState.value !== 'connected') return;
+    const text = e.clipboardData?.getData('text/plain');
+    if (!text) return;
+    e.preventDefault();
+    if (sendToRemoteClipboard(text)) {
+        message.success(`已粘贴 ${text.length} 个字符到远程剪贴板`);
+    }
+}
+
+// ============ 重启浏览器 ============
+
+function confirmRestartBrowser() {
+    Modal.confirm({
+        title: '重启浏览器实例',
+        content: '将关闭并重新启动所有浏览器（含共享标签页），正在执行中的请求会失败。确定继续？',
+        okText: '重启浏览器',
+        okType: 'danger',
+        cancelText: '取消',
+        async onOk() {
+            restarting.value = true;
+            try {
+                const res = await fetch('/admin/pool/restart', {
+                    method: 'POST',
+                    headers: {
+                        ...settingsStore.getHeaders(),
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({})
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok && data.success) {
+                    message.success(data.message || '浏览器重启完成');
+                } else if (res.status === 207) {
+                    message.warning(data.message || '部分浏览器重启失败，详情见日志');
+                } else {
+                    message.error(data.message || '浏览器重启失败');
+                }
+            } catch (e) {
+                message.error('请求失败: ' + e.message);
+            } finally {
+                restarting.value = false;
+            }
+        }
+    });
+}
+
+// ============ Worker 状态提示 ============
+
+async function fetchWorkersHint() {
+    try {
+        const res = await fetch('/admin/pool/workers', { headers: settingsStore.getHeaders() });
+        if (res.ok) {
+            const data = await res.json();
+            if (data?.workers?.length) {
+                vncStatus.value = {
+                    ...(vncStatus.value || {}),
+                    workerCount: data.workers.length
+                };
+            }
+        }
+    } catch { /* 静默 */ }
+}
+
 onMounted(async () => {
     await fetchVncStatus();
+    fetchWorkersHint();
     document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('keydown', handleKeyDown, true);
+    document.addEventListener('paste', handlePaste, true);
 });
 
 onUnmounted(() => {
     disconnectVnc();
     document.removeEventListener('fullscreenchange', handleFullscreenChange);
+    document.removeEventListener('keydown', handleKeyDown, true);
+    document.removeEventListener('paste', handlePaste, true);
 });
 </script>
 
@@ -184,17 +353,35 @@ onUnmounted(() => {
                             </template>
                             断开
                         </a-button>
+                        <a-tooltip title="粘贴本地剪贴板到远程系统（连接后也可直接 Ctrl+V）">
+                            <a-button @click="pasteToRemote" :disabled="connectionState !== 'connected'">
+                                <template #icon>
+                                    <SnippetsOutlined />
+                                </template>
+                            </a-button>
+                        </a-tooltip>
                         <a-button @click="toggleFullscreen" :disabled="connectionState !== 'connected'">
                             <template #icon>
                                 <CompressOutlined v-if="isFullscreen" />
                                 <ExpandOutlined v-else />
                             </template>
                         </a-button>
-                        <a-button @click="fetchVncStatus">
-                            <template #icon>
-                                <ReloadOutlined />
-                            </template>
-                        </a-button>
+                        <a-tooltip title="刷新状态">
+                            <a-button @click="fetchVncStatus">
+                                <template #icon>
+                                    <ReloadOutlined />
+                                </template>
+                            </a-button>
+                        </a-tooltip>
+                        <a-tooltip title="重启浏览器实例（关闭并重新启动所有浏览器）">
+                            <a-button danger @click="confirmRestartBrowser" :loading="restarting">
+                                <template #icon>
+                                    <SyncOutlined v-if="!restarting" />
+                                    <ClusterOutlined v-else />
+                                </template>
+                                重启浏览器
+                            </a-button>
+                        </a-tooltip>
                     </a-space>
                 </div>
 
@@ -213,8 +400,20 @@ onUnmounted(() => {
                 <!-- 信息 -->
                 <div style="margin-top: 12px; font-size: 12px; color: #8c8c8c;">
                     显示器: {{ vncStatus.display }} | VNC 端口: {{ vncStatus.port }}
+                    <span v-if="vncStatus.workerCount"> | 浏览器实例: {{ vncStatus.workerCount }}</span>
+                    <span v-if="connectionState === 'connected'"> | 已连接：Ctrl+V 或"粘贴"按钮可发送本地剪贴板，远程复制会自动同步到本地</span>
                 </div>
             </div>
         </a-card>
+
+        <!-- 手动粘贴弹窗（剪贴板 API 不可用时的兜底） -->
+        <a-modal v-model:open="pasteModalVisible" title="手动粘贴到远程剪贴板" ok-text="发送到远程" cancel-text="取消"
+            @ok="sendPasteModal">
+            <div style="margin-bottom: 8px; color: #8c8c8c; font-size: 12px;">
+                浏览器未授权读取本地剪贴板（或非 HTTPS 环境），请在下方输入框中手动 Ctrl+V 粘贴内容后发送。
+                发送后在远程系统里按 Ctrl+V 即可粘贴。
+            </div>
+            <a-textarea v-model:value="pasteText" placeholder="在此粘贴内容..." :rows="8" />
+        </a-modal>
     </a-layout>
 </template>

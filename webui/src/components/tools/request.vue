@@ -16,7 +16,12 @@ import {
     RedoOutlined,
     InboxOutlined,
     LoadingOutlined,
-    CopyOutlined
+    CopyOutlined,
+    BugOutlined,
+    CameraOutlined,
+    FieldTimeOutlined,
+    ProfileOutlined,
+    ThunderboltOutlined
 } from '@ant-design/icons-vue';
 import { message, Modal } from 'ant-design-vue';
 
@@ -47,6 +52,7 @@ const stats = ref({ total: 0, success: 0, failed: 0, avgDuration: 0 });
 const drawerVisible = ref(false);
 const currentRecord = ref(null);
 const detailLoading = ref(false);
+const activeDetailTab = ref('overview');
 
 // 快速预览弹窗
 const previewModalVisible = ref(false);
@@ -71,7 +77,6 @@ const sending = ref(false);
 const currentModelSupportsImage = computed(() => {
     if (!sendModel.value) return false;
     const model = sendModelList.value.find(m => m.id === sendModel.value);
-    if (!model) return false;
     return model.image_policy !== 'forbidden';
 });
 
@@ -88,6 +93,38 @@ const statusConfig = {
     failed: { color: '#ff4d4f', text: '失败', icon: CloseCircleOutlined },
     pending: { color: '#faad14', text: '处理中', icon: ClockCircleOutlined }
 };
+
+// 失败阶段中文映射
+const stageLabels = {
+    dispatch_no_worker: '分发阶段：无可用 Worker',
+    dispatch_failover_exhausted: '分发阶段：故障转移耗尽',
+    adapter_failover_exhausted: '适配器阶段：适配器切换耗尽',
+    adapter: '适配器执行阶段',
+    browser: '浏览器/页面阶段',
+    pool_init: '工作池初始化阶段',
+    queue_internal: '服务器内部异常',
+    unknown: '未知阶段'
+};
+
+// 是否有富错误诊断信息
+const hasErrorDetail = computed(() => {
+    const r = currentRecord.value;
+    if (!r || r.status !== 'failed') return false;
+    return !!(r.error_code || r.error_stage || r.error_stack || (r.attempts && r.attempts.length) || r.worker_name || r.adapter_id);
+});
+
+// 展平尝试链（适配器子尝试缩进展示）
+const flatAttempts = computed(() => {
+    const r = currentRecord.value;
+    const out = [];
+    for (const a of (r?.attempts || [])) {
+        out.push(a);
+        for (const sub of (a.adapterAttempts || [])) {
+            out.push({ ...sub, sub: true });
+        }
+    }
+    return out;
+});
 
 // 获取历史列表
 const fetchHistory = async () => {
@@ -185,6 +222,8 @@ const viewDetail = async (record) => {
         });
         if (res.ok) {
             currentRecord.value = await res.json();
+            // 失败记录默认打开错误诊断 Tab，其余打开概览
+            activeDetailTab.value = (currentRecord.value.status === 'failed' && hasErrorDetail.value) ? 'error' : 'overview';
             // 预加载详情中的媒体
             if (currentRecord.value.responseMedia) {
                 for (const media of currentRecord.value.responseMedia) {
@@ -234,6 +273,146 @@ const getCachedMediaUrl = (media) => {
     if (!media || !media.localPath) return null;
     const filename = media.localPath.split('/').pop();
     return mediaCache.value[filename] || null;
+};
+
+// ============ 操作追踪截图（trace/<id>/ 目录） ============
+
+// 获取 trace 截图 Blob URL（带认证 + 缓存）
+const getTraceBlobUrl = async (recordId, file) => {
+    if (!recordId || !file) return null;
+    const cacheKey = `trace/${recordId}/${file}`;
+    if (mediaCache.value[cacheKey]) {
+        return mediaCache.value[cacheKey];
+    }
+    try {
+        const res = await fetch(`/admin/history/media/trace/${recordId}/${file}`, {
+            headers: settingsStore.getHeaders()
+        });
+        if (res.ok) {
+            const blob = await res.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            mediaCache.value[cacheKey] = blobUrl;
+            return blobUrl;
+        }
+    } catch (e) {
+        console.error('获取追踪截图失败', e);
+    }
+    return null;
+};
+
+// 从缓存取 trace 截图 URL
+const getCachedTraceUrl = (recordId, file) => {
+    if (!recordId || !file) return null;
+    return mediaCache.value[`trace/${recordId}/${file}`] || null;
+};
+
+// 按 Tab 懒加载对应截图
+const loadTabImages = async (tab) => {
+    const r = currentRecord.value;
+    if (!r) return;
+    if (tab === 'ops') {
+        for (const op of (r.traceOps || [])) {
+            if (op.screenshot) await getTraceBlobUrl(r.id, op.screenshot);
+        }
+    } else if (tab === 'snaps') {
+        for (const snap of (r.traceSnaps || [])) {
+            if (snap.file) await getTraceBlobUrl(r.id, snap.file);
+        }
+    }
+};
+
+// 切换 Tab 时按需加载
+watch(activeDetailTab, (tab) => {
+    if (tab === 'ops' || tab === 'snaps') {
+        loadTabImages(tab);
+    }
+});
+
+// 生成操作日志文本
+const traceLogText = computed(() => {
+    const r = currentRecord.value;
+    const ops = r?.traceOps || [];
+    if (ops.length === 0) return '';
+
+    const lines = [];
+    lines.push(`# 请求 ${r.id} 操作日志`);
+    lines.push(`# 模型: ${r.model_name || r.model_id || '-'} | 状态: ${r.status} | 耗时: ${r.duration_ms ?? '-'}ms`);
+    if (r.worker_name) lines.push(`# Worker: ${r.worker_name} | 适配器: ${r.adapter_id || '-'}`);
+
+    for (const op of ops) {
+        const t = new Date(op.at).toLocaleTimeString('zh-CN', { hour12: false })
+            + '.' + String(op.at % 1000).padStart(3, '0');
+        const offset = `+${((op.offsetMs || 0) / 1000).toFixed(1)}s`;
+        const scope = [op.worker, op.adapter].filter(Boolean).join('/') || '-';
+        let line = `[${t} ${offset}] [${scope}] ${op.action}${op.detail ? `: ${op.detail}` : ''}`;
+        if (op.durationMs != null) line += ` (耗时 ${op.durationMs}ms)`;
+        if (op.selector) line += ` | 选择器: ${op.selector}`;
+        if (op.url) line += ` | URL: ${op.url}`;
+        if (op.httpStatus != null) line += ` | HTTP ${op.httpStatus}`;
+        if (op.error) line += ` | 错误: ${op.error}`;
+        if (op.screenshot) line += ` | 截图: ${op.screenshot}`;
+        lines.push(line);
+    }
+    return lines.join('\n');
+});
+
+// 复制操作日志
+const copyTraceLog = async () => {
+    try {
+        await navigator.clipboard.writeText(traceLogText.value);
+        message.success('操作日志已复制');
+    } catch {
+        message.error('复制失败');
+    }
+};
+
+// 生成 AI-Agent 可用的结构化诊断报告
+const buildDiagnosticReport = () => {
+    const r = currentRecord.value;
+    if (!r) return '';
+    return JSON.stringify({
+        id: r.id,
+        created_at: r.created_at ? new Date(r.created_at).toISOString() : null,
+        status: r.status,
+        duration_ms: r.duration_ms,
+        model: { id: r.model_id, name: r.model_name },
+        worker: r.worker_name,
+        adapter: r.adapter_id,
+        error: {
+            message: r.error_message,
+            code: r.error_code,
+            stage: r.error_stage,
+            stage_label: stageLabels[r.error_stage] || r.error_stage,
+            stack: r.error_stack
+        },
+        attempts: r.attempts || [],
+        request_meta: r.request_meta,
+        operation_log: traceLogText.value,
+        screenshots: {
+            operation_shots: (r.traceOps || []).map(o => o.screenshot).filter(Boolean),
+            interval_snaps: (r.traceSnaps || []).map(s => s.file)
+        }
+    }, null, 2);
+};
+
+// 复制诊断报告
+const copyDiagnosticReport = async () => {
+    try {
+        await navigator.clipboard.writeText(buildDiagnosticReport());
+        message.success('诊断报告已复制，可直接交给 AI 分析');
+    } catch {
+        message.error('复制失败');
+    }
+};
+
+// 点击追踪截图放大
+const previewTraceImage = (recordId, file, title) => {
+    const url = getCachedTraceUrl(recordId, file);
+    if (!url) return;
+    previewMediaType.value = 'image';
+    previewMediaUrl.value = url;
+    previewTitle.value = title || '截图';
+    previewModalVisible.value = true;
 };
 
 // 重试下载媒体
@@ -352,6 +531,20 @@ const formatDuration = (ms) => {
     if (!ms) return '-';
     if (ms < 1000) return `${ms}ms`;
     return `${(ms / 1000).toFixed(1)}s`;
+};
+
+// 格式化相对偏移
+const formatOffset = (ms) => {
+    if (ms == null) return '-';
+    if (ms < 1000) return `+${ms}ms`;
+    return `+${(ms / 1000).toFixed(1)}s`;
+};
+
+// 格式化精确时间（含毫秒）
+const formatPreciseTime = (timestamp) => {
+    if (!timestamp) return '-';
+    const d = new Date(timestamp);
+    return d.toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
 };
 
 // 截断文本
@@ -891,7 +1084,7 @@ onUnmounted(() => {
                 </a-button>
             </div>
             <div class="toolbar-row">
-                <a-input-search v-model:value="searchText" placeholder="搜索 Prompt 或响应内容" size="small"
+                <a-input-search v-model:value="searchText" placeholder="搜索 Prompt、响应或错误信息" size="small"
                     allow-clear style="width: 100%;" />
             </div>
         </div>
@@ -1003,101 +1196,285 @@ onUnmounted(() => {
     </a-card>
 
     <!-- 详情抽屉 -->
-    <a-drawer v-model:open="drawerVisible" title="请求详情" placement="right" :width="isMobile ? '100%' : 700" :destroy-on-close="true">
+    <a-drawer v-model:open="drawerVisible" title="请求详情" placement="right" :width="isMobile ? '100%' : 780" :destroy-on-close="true">
         <a-spin :spinning="detailLoading">
             <template v-if="currentRecord">
-                <!-- 基本信息 -->
-                <a-descriptions :column="isMobile ? 1 : 2" size="small" bordered>
-                    <a-descriptions-item label="请求 ID" :span="2">
-                        <code>{{ currentRecord.id }}</code>
-                    </a-descriptions-item>
-                    <a-descriptions-item label="时间">
-                        {{ new Date(currentRecord.created_at).toLocaleString('zh-CN') }}
-                    </a-descriptions-item>
-                    <a-descriptions-item label="状态">
-                        <a-tag :color="statusConfig[currentRecord.status]?.color">
-                            {{ statusConfig[currentRecord.status]?.text || currentRecord.status }}
-                        </a-tag>
-                    </a-descriptions-item>
-                    <a-descriptions-item label="模型" :span="2">
-                        {{ currentRecord.model_name || currentRecord.model_id || '-' }}
-                    </a-descriptions-item>
-                    <a-descriptions-item label="耗时">
-                        {{ formatDuration(currentRecord.duration_ms) }}
-                    </a-descriptions-item>
-                    <a-descriptions-item label="流式">
-                        {{ currentRecord.isStreaming ? '是' : '否' }}
-                    </a-descriptions-item>
-                </a-descriptions>
+                <a-tabs v-model:activeKey="activeDetailTab" size="small">
+                    <!-- ============ Tab 1: 概览 ============ -->
+                    <a-tab-pane key="overview" tab="概览">
+                        <!-- 基本信息 -->
+                        <a-descriptions :column="isMobile ? 1 : 2" size="small" bordered>
+                            <a-descriptions-item label="请求 ID" :span="2">
+                                <code>{{ currentRecord.id }}</code>
+                            </a-descriptions-item>
+                            <a-descriptions-item label="时间">
+                                {{ new Date(currentRecord.created_at).toLocaleString('zh-CN') }}
+                            </a-descriptions-item>
+                            <a-descriptions-item label="状态">
+                                <a-tag :color="statusConfig[currentRecord.status]?.color">
+                                    {{ statusConfig[currentRecord.status]?.text || currentRecord.status }}
+                                </a-tag>
+                            </a-descriptions-item>
+                            <a-descriptions-item label="模型" :span="2">
+                                {{ currentRecord.model_name || currentRecord.model_id || '-' }}
+                            </a-descriptions-item>
+                            <a-descriptions-item label="耗时">
+                                {{ formatDuration(currentRecord.duration_ms) }}
+                            </a-descriptions-item>
+                            <a-descriptions-item label="流式">
+                                {{ currentRecord.isStreaming ? '是' : '否' }}
+                            </a-descriptions-item>
+                            <a-descriptions-item v-if="currentRecord.worker_name" label="Worker">
+                                {{ currentRecord.worker_name }}
+                            </a-descriptions-item>
+                            <a-descriptions-item v-if="currentRecord.adapter_id" label="适配器">
+                                {{ currentRecord.adapter_id }}
+                            </a-descriptions-item>
+                        </a-descriptions>
 
-                <!-- Prompt -->
-                <a-divider orientation="left">Prompt</a-divider>
-                <div class="content-box">
-                    {{ currentRecord.prompt || '无' }}
-                </div>
+                        <!-- Prompt -->
+                        <a-divider orientation="left">Prompt</a-divider>
+                        <div class="content-box">
+                            {{ currentRecord.prompt || '无' }}
+                        </div>
 
-                <!-- 输入图片 -->
-                <template v-if="currentRecord.inputImages && currentRecord.inputImages.length > 0">
-                    <a-divider orientation="left">输入图片</a-divider>
-                    <div class="media-list">
-                        <span v-for="(img, idx) in currentRecord.inputImages" :key="idx" class="media-item">
-                            <a-tag>{{ img.split('/').pop() }}</a-tag>
-                        </span>
-                    </div>
-                </template>
+                        <!-- 输入图片 -->
+                        <template v-if="currentRecord.inputImages && currentRecord.inputImages.length > 0">
+                            <a-divider orientation="left">输入图片</a-divider>
+                            <div class="media-list">
+                                <span v-for="(img, idx) in currentRecord.inputImages" :key="idx" class="media-item">
+                                    <a-tag>{{ img.split('/').pop() }}</a-tag>
+                                </span>
+                            </div>
+                        </template>
 
-                <!-- 响应内容 -->
-                <a-divider orientation="left">响应内容</a-divider>
-                <div class="content-box" :class="{ 'error-box': currentRecord.status === 'failed' }">
-                    <template v-if="currentRecord.status === 'failed'">
-                        {{ currentRecord.error_message || '未知错误' }}
-                    </template>
-                    <template v-else>
-                        {{ currentRecord.response_text || '无响应' }}
-                    </template>
-                </div>
+                        <!-- 响应内容 -->
+                        <a-divider orientation="left">响应内容</a-divider>
+                        <div class="content-box" :class="{ 'error-box': currentRecord.status === 'failed' }">
+                            <template v-if="currentRecord.status === 'failed'">
+                                {{ currentRecord.error_message || '未知错误' }}
+                            </template>
+                            <template v-else>
+                                {{ currentRecord.response_text || '无响应' }}
+                            </template>
+                        </div>
 
-                <!-- 思考过程 -->
-                <template v-if="currentRecord.reasoning_content">
-                    <a-divider orientation="left">思考过程</a-divider>
-                    <div class="content-box reasoning-box">
-                        {{ currentRecord.reasoning_content }}
-                    </div>
-                </template>
+                        <!-- 思考过程 -->
+                        <template v-if="currentRecord.reasoning_content">
+                            <a-divider orientation="left">思考过程</a-divider>
+                            <div class="content-box reasoning-box">
+                                {{ currentRecord.reasoning_content }}
+                            </div>
+                        </template>
 
-                <!-- 媒体内容 -->
-                <template v-if="currentRecord.responseMedia && currentRecord.responseMedia.length > 0">
-                    <a-divider orientation="left">媒体内容 ({{ currentRecord.responseMedia.length }})</a-divider>
-                    <div class="media-gallery-large">
-                        <div v-for="(media, idx) in currentRecord.responseMedia" :key="idx" class="media-card-large">
-                            <div class="media-preview-large">
-                                <template v-if="media.status === 'downloaded' && getCachedMediaUrl(media)">
-                                    <img v-if="media.type === 'image'" :src="getCachedMediaUrl(media)" alt="生成图片" />
-                                    <video v-else-if="media.type === 'video'" :src="getCachedMediaUrl(media)" controls />
-                                </template>
-                                <template v-else>
-                                    <div class="media-placeholder-large">
-                                        <PictureOutlined v-if="media.type === 'image'" />
-                                        <PlayCircleOutlined v-else-if="media.type === 'video'" />
-                                        <FileTextOutlined v-else />
-                                        <div class="media-status">
-                                            <a-tag v-if="media.status === 'failed'" color="red">下载失败</a-tag>
-                                            <a-tag v-else-if="media.status === 'external'" color="blue">外部链接</a-tag>
-                                            <a-tag v-else-if="media.status === 'pending'" color="orange">待下载</a-tag>
-                                        </div>
-                                        <a-button v-if="media.status === 'failed'" type="primary" size="small"
-                                            @click="retryMedia(currentRecord.id, idx)">
-                                            <template #icon>
-                                                <ReloadOutlined />
-                                            </template>
-                                            重试下载
-                                        </a-button>
+                        <!-- 媒体内容 -->
+                        <template v-if="currentRecord.responseMedia && currentRecord.responseMedia.length > 0">
+                            <a-divider orientation="left">媒体内容 ({{ currentRecord.responseMedia.length }})</a-divider>
+                            <div class="media-gallery-large">
+                                <div v-for="(media, idx) in currentRecord.responseMedia" :key="idx" class="media-card-large">
+                                    <div class="media-preview-large">
+                                        <template v-if="media.status === 'downloaded' && getCachedMediaUrl(media)">
+                                            <img v-if="media.type === 'image'" :src="getCachedMediaUrl(media)" alt="生成图片" />
+                                            <video v-else-if="media.type === 'video'" :src="getCachedMediaUrl(media)" controls />
+                                        </template>
+                                        <template v-else>
+                                            <div class="media-placeholder-large">
+                                                <PictureOutlined v-if="media.type === 'image'" />
+                                                <PlayCircleOutlined v-else-if="media.type === 'video'" />
+                                                <FileTextOutlined v-else />
+                                                <div class="media-status">
+                                                    <a-tag v-if="media.status === 'failed'" color="red">下载失败</a-tag>
+                                                    <a-tag v-else-if="media.status === 'external'" color="blue">外部链接</a-tag>
+                                                    <a-tag v-else-if="media.status === 'pending'" color="orange">待下载</a-tag>
+                                                </div>
+                                                <a-button v-if="media.status === 'failed'" type="primary" size="small"
+                                                    @click="retryMedia(currentRecord.id, idx)">
+                                                    <template #icon>
+                                                        <ReloadOutlined />
+                                                    </template>
+                                                    重试下载
+                                                </a-button>
+                                            </div>
+                                        </template>
                                     </div>
-                                </template>
+                                </div>
+                            </div>
+                        </template>
+                    </a-tab-pane>
+
+                    <!-- ============ Tab 2: 错误诊断 ============ -->
+                    <a-tab-pane key="error" v-if="currentRecord.status === 'failed'">
+                        <template #tab>
+                            <span><BugOutlined /> 错误诊断</span>
+                        </template>
+                        <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+                            <a-button size="small" type="primary" ghost @click="copyDiagnosticReport">
+                                <template #icon><CopyOutlined /></template>
+                                复制诊断报告（给 AI）
+                            </a-button>
+                        </div>
+
+                        <!-- 错误消息 -->
+                        <a-alert type="error" show-icon style="margin-bottom: 12px;">
+                            <template #message>{{ currentRecord.error_message || '未知错误' }}</template>
+                        </a-alert>
+
+                        <!-- 错误关键信息 -->
+                        <a-descriptions :column="isMobile ? 1 : 2" size="small" bordered style="margin-bottom: 12px;">
+                            <a-descriptions-item v-if="currentRecord.error_code" label="错误代码">
+                                <a-tag color="red">{{ currentRecord.error_code }}</a-tag>
+                            </a-descriptions-item>
+                            <a-descriptions-item v-if="currentRecord.error_stage" label="失败阶段">
+                                <a-tag color="orange">{{ stageLabels[currentRecord.error_stage] || currentRecord.error_stage }}</a-tag>
+                            </a-descriptions-item>
+                            <a-descriptions-item v-if="currentRecord.worker_name" label="Worker">
+                                {{ currentRecord.worker_name }}
+                            </a-descriptions-item>
+                            <a-descriptions-item v-if="currentRecord.adapter_id" label="适配器">
+                                {{ currentRecord.adapter_id }}
+                            </a-descriptions-item>
+                            <a-descriptions-item v-if="flatAttempts.length" label="尝试次数">
+                                {{ flatAttempts.length }}
+                            </a-descriptions-item>
+                            <a-descriptions-item label="总耗时">
+                                {{ formatDuration(currentRecord.duration_ms) }}
+                            </a-descriptions-item>
+                        </a-descriptions>
+
+                        <!-- 请求元信息 -->
+                        <template v-if="currentRecord.requestMeta">
+                            <a-divider orientation="left" plain>请求元信息</a-divider>
+                            <a-descriptions :column="isMobile ? 1 : 3" size="small" bordered style="margin-bottom: 12px;">
+                                <a-descriptions-item label="流式">{{ currentRecord.requestMeta.stream ? '是' : '否' }}</a-descriptions-item>
+                                <a-descriptions-item label="请求思考">{{ currentRecord.requestMeta.reasoning ? '是' : '否' }}</a-descriptions-item>
+                                <a-descriptions-item label="输入图片">{{ currentRecord.requestMeta.imageCount ?? 0 }} 张</a-descriptions-item>
+                                <a-descriptions-item label="Prompt 长度">{{ currentRecord.requestMeta.promptChars ?? '-' }} 字符</a-descriptions-item>
+                                <a-descriptions-item label="客户端" :span="isMobile ? 1 : 2">
+                                    <span style="word-break: break-all; font-size: 11px;">{{ currentRecord.requestMeta.userAgent || '-' }}</span>
+                                </a-descriptions-item>
+                            </a-descriptions>
+                        </template>
+
+                        <!-- 尝试链 -->
+                        <template v-if="flatAttempts.length > 0">
+                            <a-divider orientation="left" plain>
+                                重试链 ({{ flatAttempts.length }} 次尝试)
+                            </a-divider>
+                            <div class="attempt-list">
+                                <div v-for="(att, idx) in flatAttempts" :key="idx"
+                                    class="attempt-item" :class="{ 'attempt-sub': att.sub }">
+                                    <div class="attempt-header">
+                                        <a-tag :color="att.sub ? 'blue' : 'purple'">
+                                            {{ att.sub ? '↳ 适配器尝试' : `第 ${att.index} 个 Worker` }}
+                                        </a-tag>
+                                        <span class="attempt-scope">
+                                            {{ [att.worker, att.adapter].filter(Boolean).join(' / ') || '-' }}
+                                            <template v-if="att.model"> ({{ att.model }})</template>
+                                        </span>
+                                        <span class="attempt-duration">{{ formatDuration(att.durationMs) }}</span>
+                                        <a-tag v-if="att.retryable === false" color="red">不可重试</a-tag>
+                                        <a-tag v-else-if="att.retryable === true" color="green">可重试</a-tag>
+                                        <span class="attempt-time">{{ formatPreciseTime(att.at) }}</span>
+                                    </div>
+                                    <div class="attempt-error">{{ att.error || '-' }}</div>
+                                </div>
+                            </div>
+                        </template>
+
+                        <!-- 错误堆栈 -->
+                        <template v-if="currentRecord.error_stack">
+                            <a-divider orientation="left" plain>错误堆栈</a-divider>
+                            <div class="content-box stack-box">{{ currentRecord.error_stack }}</div>
+                        </template>
+
+                        <!-- 无富信息时的提示 -->
+                        <a-alert v-if="!hasErrorDetail" type="info" show-icon
+                            message="该记录创建于富错误诊断功能上线前，仅包含基础错误消息。" style="margin-top: 12px;" />
+                    </a-tab-pane>
+
+                    <!-- ============ Tab 3: 操作截图 ============ -->
+                    <a-tab-pane key="ops" v-if="(currentRecord.traceOps || []).length > 0">
+                        <template #tab>
+                            <span><CameraOutlined /> 操作截图 ({{ (currentRecord.traceOps || []).length }})</span>
+                        </template>
+                        <div class="trace-hint">每次页面操作（点击/输入/导航/上传/API 响应等）完成后的画面截图，按执行顺序排列。</div>
+                        <div class="op-list">
+                            <div v-for="op in currentRecord.traceOps" :key="op.seq" class="op-item"
+                                :class="{ 'op-item-error': op.level === 'error' }">
+                                <div class="op-meta">
+                                    <span class="op-seq">#{{ op.seq }}</span>
+                                    <span class="op-time">{{ formatPreciseTime(op.at) }} ({{ formatOffset(op.offsetMs) }})</span>
+                                    <a-tag v-if="op.worker || op.adapter" size="small" color="purple">
+                                        {{ [op.worker, op.adapter].filter(Boolean).join('/') }}
+                                    </a-tag>
+                                    <span class="op-action">{{ op.action }}</span>
+                                    <a-tag v-if="op.level === 'error'" color="red" size="small">错误</a-tag>
+                                    <span v-if="op.durationMs != null" class="op-duration">{{ formatDuration(op.durationMs) }}</span>
+                                </div>
+                                <div class="op-detail" v-if="op.detail || op.error">
+                                    <span v-if="op.detail">{{ op.detail }}</span>
+                                    <span v-if="op.error" class="op-error">⚠ {{ op.error }}</span>
+                                </div>
+                                <div class="op-url" v-if="op.url">
+                                    <span style="word-break: break-all;">{{ op.url }}</span>
+                                    <a-tag v-if="op.httpStatus != null" size="small"
+                                        :color="op.httpStatus < 400 ? 'green' : 'red'">HTTP {{ op.httpStatus }}</a-tag>
+                                </div>
+                                <div v-if="op.screenshot" class="op-screenshot">
+                                    <img v-if="getCachedTraceUrl(currentRecord.id, op.screenshot)"
+                                        :src="getCachedTraceUrl(currentRecord.id, op.screenshot)"
+                                        loading="lazy" class="op-shot-img"
+                                        @click="previewTraceImage(currentRecord.id, op.screenshot, `操作截图 #${op.seq} ${op.action}`)" />
+                                    <div v-else class="op-shot-loading">
+                                        <LoadingOutlined /> 加载截图...
+                                    </div>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                </template>
+                    </a-tab-pane>
+
+                    <!-- ============ Tab 4: 时间线截图 ============ -->
+                    <a-tab-pane key="snaps" v-if="(currentRecord.traceSnaps || []).length > 0">
+                        <template #tab>
+                            <span><FieldTimeOutlined /> 时间线截图 ({{ (currentRecord.traceSnaps || []).length }})</span>
+                        </template>
+                        <div class="trace-hint">请求期间每 2 秒自动截取的画面快照，可还原整个执行过程的画面变化。</div>
+                        <div class="snap-grid">
+                            <div v-for="snap in currentRecord.traceSnaps" :key="snap.seq" class="snap-item">
+                                <img v-if="getCachedTraceUrl(currentRecord.id, snap.file)"
+                                    :src="getCachedTraceUrl(currentRecord.id, snap.file)"
+                                    loading="lazy" class="snap-img"
+                                    @click="previewTraceImage(currentRecord.id, snap.file, `快照 #${snap.seq}`)" />
+                                <div v-else class="snap-loading"><LoadingOutlined /></div>
+                                <div class="snap-label">#{{ snap.seq }} · {{ formatOffset(snap.offsetMs) }}</div>
+                            </div>
+                        </div>
+                    </a-tab-pane>
+
+                    <!-- ============ Tab 5: 操作日志 ============ -->
+                    <a-tab-pane key="opLog" v-if="traceLogText">
+                        <template #tab>
+                            <span><ProfileOutlined /> 操作日志</span>
+                        </template>
+                        <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+                            <a-button size="small" @click="copyTraceLog">
+                                <template #icon><CopyOutlined /></template>
+                                复制全部日志
+                            </a-button>
+                        </div>
+                        <div class="content-box log-box">{{ traceLogText }}</div>
+                    </a-tab-pane>
+                </a-tabs>
+
+                <!-- 无任何追踪数据的提示（旧记录） -->
+                <a-alert v-if="(currentRecord.traceOps || []).length === 0 && (currentRecord.traceSnaps || []).length === 0"
+                    type="info" show-icon style="margin-top: 16px;"
+                >
+                    <template #message>
+                        <ThunderboltOutlined /> 该记录没有操作追踪数据（创建于追踪功能上线前，或浏览器运行在 headless 隐藏模式）。
+                        新请求在非隐藏模式下会自动记录操作截图、每 2 秒快照与操作日志。
+                    </template>
+                </a-alert>
             </template>
         </a-spin>
     </a-drawer>
@@ -1354,6 +1731,208 @@ onUnmounted(() => {
     color: #389e0d;
 }
 
+.content-box.stack-box {
+    font-size: 12px;
+    color: #d4380d;
+    background: #fff7e6;
+    border-color: #ffd591;
+    max-height: 300px;
+}
+
+.content-box.log-box {
+    font-size: 12px;
+    line-height: 1.7;
+    max-height: 65vh;
+}
+
+/* === 错误诊断：尝试链样式 === */
+.attempt-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.attempt-item {
+    border: 1px solid #f0f0f0;
+    border-left: 3px solid #722ed1;
+    border-radius: 4px;
+    padding: 8px 12px;
+    background: #fafafa;
+}
+
+.attempt-item.attempt-sub {
+    border-left-color: #1890ff;
+    margin-left: 24px;
+    background: #f0f7ff;
+}
+
+.attempt-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.attempt-scope {
+    font-weight: 600;
+    font-size: 12px;
+}
+
+.attempt-duration {
+    font-size: 11px;
+    color: #8c8c8c;
+}
+
+.attempt-time {
+    font-size: 11px;
+    color: #bfbfbf;
+    margin-left: auto;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+.attempt-error {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #cf1322;
+    word-break: break-all;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+/* === 操作截图 Tab === */
+.trace-hint {
+    font-size: 12px;
+    color: #8c8c8c;
+    margin-bottom: 12px;
+}
+
+.op-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.op-item {
+    border: 1px solid #f0f0f0;
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: #fafafa;
+}
+
+.op-item.op-item-error {
+    border-color: #ffccc7;
+    background: #fff7f6;
+}
+
+.op-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.op-seq {
+    font-weight: 600;
+    color: #595959;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+.op-time {
+    font-size: 11px;
+    color: #8c8c8c;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+.op-action {
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.op-duration {
+    font-size: 11px;
+    color: #8c8c8c;
+}
+
+.op-detail {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #595959;
+    word-break: break-all;
+}
+
+.op-error {
+    margin-left: 8px;
+    color: #cf1322;
+}
+
+.op-url {
+    margin-top: 4px;
+    font-size: 11px;
+    color: #8c8c8c;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+.op-screenshot {
+    margin-top: 8px;
+}
+
+.op-shot-img {
+    max-width: 100%;
+    max-height: 300px;
+    border-radius: 4px;
+    border: 1px solid #f0f0f0;
+    cursor: zoom-in;
+    display: block;
+}
+
+.op-shot-loading {
+    padding: 20px;
+    text-align: center;
+    color: #bfbfbf;
+    background: #f5f5f5;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+/* === 时间线截图 Tab === */
+.snap-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+}
+
+.snap-item {
+    border: 1px solid #f0f0f0;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #fafafa;
+}
+
+.snap-img {
+    width: 100%;
+    aspect-ratio: 16/9;
+    object-fit: cover;
+    cursor: zoom-in;
+    display: block;
+}
+
+.snap-loading {
+    width: 100%;
+    aspect-ratio: 16/9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #bfbfbf;
+}
+
+.snap-label {
+    font-size: 11px;
+    color: #595959;
+    text-align: center;
+    padding: 4px;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
 /* 详情页媒体样式 - 更大尺寸 */
 .media-gallery-large {
     display: flex;
@@ -1539,6 +2118,14 @@ onUnmounted(() => {
     .media-preview-large {
         min-height: 200px;
         max-height: 350px;
+    }
+
+    .snap-grid {
+        grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    }
+
+    .attempt-item.attempt-sub {
+        margin-left: 12px;
     }
 }
 

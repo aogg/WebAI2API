@@ -23,6 +23,7 @@
 import path from 'path';
 import { logger } from '../../utils/logger.js';
 import { TIMEOUTS } from '../../utils/constants.js';
+import { traceOp, traceError } from '../utils/trace.js';
 
 /**
  * 生成指定范围内的随机数
@@ -362,6 +363,7 @@ export async function safeClick(page, target, options = {}) {
 
     // 带超时的执行（移除了重试机制）
     let timeoutId;
+    const clickStart = Date.now();
     try {
         const timeoutPromise = new Promise((_, reject) => {
             timeoutId = setTimeout(() => {
@@ -374,8 +376,21 @@ export async function safeClick(page, target, options = {}) {
             doClick().finally(() => clearTimeout(timeoutId)),
             timeoutPromise
         ]);
+
+        // 操作追踪：点击成功
+        traceOp(page, '点击元素', selector, {
+            selector,
+            durationMs: Date.now() - clickStart
+        });
     } catch (err) {
         clearTimeout(timeoutId);
+        // 操作追踪：点击失败
+        traceError(page, '点击元素', err, {
+            selector,
+            detail: `点击操作失败 (${selector})`,
+            durationMs: Date.now() - clickStart,
+            screenshot: false
+        });
         throw new Error(`点击操作失败 (${selector}): ${err.message}`);
     }
 }
@@ -449,6 +464,7 @@ export async function safeScroll(page, target, options = {}) {
  */
 export async function humanType(page, target, text, options = {}) {
     const { skipFocus = false } = options;
+    const typeStart = Date.now();
 
     // 如果不跳过 focus，需要定位并聚焦元素
     if (!skipFocus) {
@@ -547,6 +563,11 @@ export async function humanType(page, target, text, options = {}) {
             document.execCommand('insertText', false, content);
         }, text);
     }
+
+    // 操作追踪：输入完成
+    traceOp(page, '输入文本', `${text.length} 字符${skipFocus ? '（跳过聚焦）' : ''}，前 50 字: ${text.slice(0, 50)}`, {
+        durationMs: Date.now() - typeStart
+    });
 }
 
 /**
@@ -604,6 +625,7 @@ async function findAllFileInputs(page) {
 export async function pasteImages(page, target, filePaths, options = {}, meta = {}) {
     if (!filePaths || filePaths.length === 0) return;
     logger.info('浏览器', `正在处理 ${filePaths.length} 张图片...`, meta);
+    const uploadStart = Date.now();
 
     // 1. 拟人化: 先点击一下目标区域 (让后台看起来像是用户聚焦了输入框)
     await safeClick(page, target, { bias: 'input' });
@@ -684,8 +706,19 @@ export async function pasteImages(page, target, filePaths, options = {}, meta = 
             await sleep(500, 1000);
         }
 
+        // 操作追踪：上传成功
+        traceOp(page, '上传图片', `${filePaths.length} 张 (${path.basename(filePaths[0])}${filePaths.length > 1 ? ' 等' : ''})`, {
+            durationMs: Date.now() - uploadStart
+        });
+
     } catch (e) {
         logger.error('浏览器', `上传失败: ${e.message}`);
+        // 操作追踪：上传失败
+        traceError(page, '上传图片', e, {
+            detail: `${filePaths.length} 张`,
+            durationMs: Date.now() - uploadStart,
+            screenshot: false
+        });
         throw e;
     }
 }
@@ -709,6 +742,7 @@ export async function uploadFilesViaChooser(page, triggerTarget, filePaths, opti
     const clickAction = options.clickAction || 'click';
     const expectedUploads = filePaths.length;
     let uploadedCount = 0;
+    const uploadStart = Date.now();
 
     logger.info('浏览器', `正在处理 ${filePaths.length} 张图片 (filechooser 模式)...`, meta);
 
@@ -761,6 +795,11 @@ export async function uploadFilesViaChooser(page, triggerTarget, filePaths, opti
         // 抛出可识别的错误让上层决定是否重试
         const error = new Error(`文件选择器等待超时: ${e.message}`);
         error.code = 'UPLOAD_FILECHOOSER_TIMEOUT';
+        traceError(page, '上传图片(filechooser)', error, {
+            detail: `${expectedUploads} 张`,
+            durationMs: Date.now() - uploadStart,
+            screenshot: false
+        });
         throw error;
     }
 
@@ -772,6 +811,11 @@ export async function uploadFilesViaChooser(page, triggerTarget, filePaths, opti
         await uploadPromise;
         logger.info('浏览器', '所有图片上传完成', meta);
     }
+
+    // 操作追踪：上传成功
+    traceOp(page, '上传图片(filechooser)', `${expectedUploads} 张`, {
+        durationMs: Date.now() - uploadStart
+    });
 }
 
 /**

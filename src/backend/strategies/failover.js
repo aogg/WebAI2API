@@ -51,12 +51,16 @@ export function createFailoverExecutor(options = {}) {
                 : Math.min(maxRetries + 1, candidates.length);
 
             let lastError = null;
+            /** @type {object[]} 每次尝试的详细记录（用于历史记录错误诊断） */
+            const attempts = [];
 
             for (let i = 0; i < maxAttempts; i++) {
                 const candidate = candidates[i];
+                const attemptStart = Date.now();
 
                 try {
                     const result = await execute(candidate);
+                    const durationMs = Date.now() - attemptStart;
 
                     // 成功返回
                     if (!result.error) {
@@ -71,10 +75,24 @@ export function createFailoverExecutor(options = {}) {
                         ? result.retryable
                         : normalizeError(lastError).retryable;
 
+                    // 记录本次尝试（含适配器级子尝试链 adapterAttempts）
+                    attempts.push({
+                        index: i + 1,
+                        worker: candidate?.name || null,
+                        adapter: result.adapter || candidate?.type || null,
+                        model: result.model || null,
+                        error: String(lastError).slice(0, 1000),
+                        code: result.code || normalizeError(lastError).code || null,
+                        retryable,
+                        durationMs,
+                        at: attemptStart,
+                        adapterAttempts: result.attempts || undefined
+                    });
+
                     // 不可重试的错误（如内容安全问题），直接返回，不尝试其他候选
                     if (!retryable) {
                         logger.debug('故障转移', `不可重试错误，停止故障转移: ${lastError}`, meta);
-                        return { error: lastError, code: 'NOT_RETRYABLE', retryable: false };
+                        return { error: lastError, code: result.code || 'NOT_RETRYABLE', retryable: false, attempts };
                     }
 
                     // 触发重试回调
@@ -84,6 +102,18 @@ export function createFailoverExecutor(options = {}) {
 
                 } catch (err) {
                     lastError = err.message || String(err);
+                    attempts.push({
+                        index: i + 1,
+                        worker: candidate?.name || null,
+                        adapter: candidate?.type || null,
+                        model: null,
+                        error: String(lastError).slice(0, 1000),
+                        code: normalizeError(lastError).code || null,
+                        retryable: normalizeError(lastError).retryable,
+                        durationMs: Date.now() - attemptStart,
+                        at: attemptStart,
+                        stack: err.stack ? String(err.stack).slice(0, 2000) : undefined
+                    });
                     if (i < maxAttempts - 1) {
                         onRetry(candidate, lastError, i + 1);
                     }
@@ -94,7 +124,8 @@ export function createFailoverExecutor(options = {}) {
             return {
                 error: `所有候选都失败: ${lastError}`,
                 code: 'FAILOVER_EXHAUSTED',
-                retryable: false
+                retryable: false,
+                attempts
             };
         }
     };

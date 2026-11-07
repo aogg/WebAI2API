@@ -16,6 +16,7 @@ import {
 import { ERROR_CODES } from './errors.js';
 import { incrementSuccess, incrementFailed } from '../utils/stats.js';
 import { createRecord, updateRecord, processResponseMedia } from '../utils/history.js';
+import { beginTrace, endTrace, buildTraceLogText } from '../backend/utils/trace.js';
 
 /**
  * @typedef {object} TaskContext
@@ -41,6 +42,22 @@ import { createRecord, updateRecord, processResponseMedia } from '../utils/histo
  * @property {import('../backend/pool.js').PoolManager} poolManager - Pool 管理器
  * @property {object} config - 配置对象
  */
+
+/**
+ * 根据错误结果推断失败阶段（便于 AI-Agent 快速定位问题层）
+ * @param {object} result - generate 返回的错误结果
+ * @returns {string} 阶段标识
+ */
+function classifyErrorStage(result) {
+    const msg = String(result?.error || '');
+    if (/没有 Worker 支持模型/.test(msg)) return 'dispatch_no_worker';
+    if (/所有候选都失败|FAILOVER_EXHAUSTED/.test(msg)) return 'dispatch_failover_exhausted';
+    if (/重新初始化失败|浏览器已断开|页面已关闭|页面崩溃|页面状态无效/.test(msg)) return 'browser';
+    if (/Pool 未初始化/.test(msg)) return 'pool_init';
+    if (/所有支持该模型的适配器都无法使用/.test(msg)) return 'adapter_failover_exhausted';
+    if (result?.code) return 'adapter';
+    return 'unknown';
+}
 
 /**
  * 创建任务队列管理器
@@ -99,7 +116,7 @@ export function createQueueManager(queueConfig, callbacks) {
 
         logger.info('服务器', '[队列] 开始处理任务', { id, remaining: queue.length });
 
-        // 创建历史记录
+        // 创建历史记录（含请求元信息）
         try {
             createRecord({
                 id,
@@ -108,11 +125,22 @@ export function createQueueManager(queueConfig, callbacks) {
                 prompt,
                 inputImages: imagePaths,
                 isStreaming,
-                status: 'pending'
+                status: 'pending',
+                requestMeta: {
+                    stream: !!isStreaming,
+                    reasoning: !!reasoning,
+                    imageCount: imagePaths?.length || 0,
+                    promptChars: prompt?.length || 0,
+                    userAgent: task.req?.headers?.['user-agent'] || null,
+                    createdAt: startTime
+                }
             });
         } catch (e) {
             logger.debug('服务器', `创建历史记录失败: ${e.message}`);
         }
+
+        // 开始操作追踪（截图仅在浏览器可见模式启用）
+        beginTrace(id, { config });
 
         // 启动心跳（流式请求）
         let heartbeatInterval = null;
@@ -138,14 +166,25 @@ export function createQueueManager(queueConfig, callbacks) {
             // 清除心跳
             if (heartbeatInterval) clearInterval(heartbeatInterval);
 
+            // 结束追踪，收集操作日志与截图
+            const trace = await endTrace(id);
+
             // 处理结果
             if (result.error) {
-                // 生成失败：记录统计和历史
+                // 生成失败：记录统计和历史（含富错误诊断信息）
                 await incrementFailed();
                 try {
                     updateRecord(id, {
                         status: 'failed',
                         errorMessage: result.error,
+                        errorCode: result.code || null,
+                        errorStage: classifyErrorStage(result),
+                        errorStack: result.stack || null,
+                        workerName: result.worker || null,
+                        adapterId: result.adapter || null,
+                        attempts: Array.isArray(result.attempts) ? result.attempts : null,
+                        traceOps: trace?.ops || null,
+                        traceSnaps: trace?.snaps || null,
                         durationMs: Date.now() - startTime
                     });
                 } catch (e) {
@@ -188,7 +227,7 @@ export function createQueueManager(queueConfig, callbacks) {
             logger.info('服务器', '结果已准备就绪', { id });
             await incrementSuccess();
 
-            // 更新历史记录（异步处理媒体，不阻塞响应）
+            // 更新历史记录（含追踪数据，异步处理媒体，不阻塞响应）
             processResponseMedia(result, id).then(responseMedia => {
                 try {
                     updateRecord(id, {
@@ -196,6 +235,10 @@ export function createQueueManager(queueConfig, callbacks) {
                         responseText: historyResponseText,
                         reasoningContent,
                         responseMedia,
+                        workerName: result.worker || null,
+                        adapterId: result.adapter || null,
+                        traceOps: trace?.ops || null,
+                        traceSnaps: trace?.snaps || null,
                         durationMs: Date.now() - startTime
                     });
                 } catch (e) {
@@ -222,12 +265,23 @@ export function createQueueManager(queueConfig, callbacks) {
             // 清除心跳
             if (heartbeatInterval) clearInterval(heartbeatInterval);
 
-            // 记录失败统计和历史
+            // 结束追踪
+            let trace = null;
+            try {
+                trace = await endTrace(id);
+            } catch { /* ignore */ }
+
+            // 记录失败统计和历史（含堆栈与追踪数据）
             await incrementFailed();
             try {
                 updateRecord(id, {
                     status: 'failed',
                     errorMessage: err.message,
+                    errorCode: err.code || 'INTERNAL_ERROR',
+                    errorStage: 'queue_internal',
+                    errorStack: err.stack || null,
+                    traceOps: trace?.ops || null,
+                    traceSnaps: trace?.snaps || null,
                     durationMs: Date.now() - startTime
                 });
             } catch (e) {

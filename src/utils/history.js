@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs/promises';
 import path from 'path';
 import { logger } from './logger.js';
+import { deleteTraceFiles } from '../backend/utils/trace.js';
 
 const DATA_DIR = path.join(process.cwd(), 'data', 'history');
 const DB_PATH = path.join(DATA_DIR, 'history.db');
@@ -14,6 +15,21 @@ const MEDIA_DIR = path.join(DATA_DIR, 'media');
 
 /** @type {Database.Database|null} */
 let db = null;
+
+/**
+ * 3.7.0 新增列（错误诊断 + 操作追踪），旧库通过 ALTER TABLE 自动迁移
+ */
+const TRACE_COLUMNS = [
+    'worker_name TEXT',
+    'adapter_id TEXT',
+    'error_code TEXT',
+    'error_stage TEXT',
+    'error_stack TEXT',
+    'attempts TEXT',
+    'trace_ops TEXT',
+    'trace_snaps TEXT',
+    'request_meta TEXT'
+];
 
 /**
  * 初始化历史记录数据库
@@ -25,6 +41,7 @@ export async function initHistoryDb() {
     // 确保目录存在
     await fs.mkdir(DATA_DIR, { recursive: true });
     await fs.mkdir(MEDIA_DIR, { recursive: true });
+    await fs.mkdir(path.join(MEDIA_DIR, 'trace'), { recursive: true });
 
     db = new Database(DB_PATH);
 
@@ -50,6 +67,17 @@ export async function initHistoryDb() {
         CREATE INDEX IF NOT EXISTS idx_model_id ON requests(model_id);
     `);
 
+    // 迁移：为旧库补充新列（已存在时忽略报错）
+    for (const col of TRACE_COLUMNS) {
+        try {
+            db.exec(`ALTER TABLE requests ADD COLUMN ${col}`);
+        } catch (e) {
+            if (!/duplicate column/i.test(e.message)) {
+                logger.warn('历史记录', `迁移列失败 ${col}: ${e.message}`);
+            }
+        }
+    }
+
     logger.info('历史记录', '数据库初始化完成');
     return db;
 }
@@ -66,6 +94,37 @@ function getDb() {
 }
 
 /**
+ * 解析 JSON 列（容忍脏数据）
+ * @param {string|null} text
+ * @returns {object|array|null}
+ */
+function parseJson(text) {
+    if (!text) return null;
+    try {
+        return JSON.parse(text);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 行记录 → 对外对象（驼峰化 + JSON 解析）
+ * @param {object} row
+ */
+function mapRow(row) {
+    return {
+        ...row,
+        inputImages: row.input_images ? JSON.parse(row.input_images) : [],
+        responseMedia: row.response_media ? JSON.parse(row.response_media) : [],
+        isStreaming: row.is_streaming === 1,
+        attempts: parseJson(row.attempts) || [],
+        traceOps: parseJson(row.trace_ops) || [],
+        traceSnaps: parseJson(row.trace_snaps) || [],
+        requestMeta: parseJson(row.request_meta) || null
+    };
+}
+
+/**
  * 创建历史记录
  * @param {object} data - 记录数据
  * @returns {string} 记录 ID
@@ -73,8 +132,8 @@ function getDb() {
 export function createRecord(data) {
     const db = getDb();
     const stmt = db.prepare(`
-        INSERT INTO requests (id, created_at, model_id, model_name, prompt, input_images, status, is_streaming)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO requests (id, created_at, model_id, model_name, prompt, input_images, status, is_streaming, request_meta)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -85,7 +144,8 @@ export function createRecord(data) {
         data.prompt || null,
         data.inputImages ? JSON.stringify(data.inputImages) : null,
         data.status || 'pending',
-        data.isStreaming ? 1 : 0
+        data.isStreaming ? 1 : 0,
+        data.requestMeta ? JSON.stringify(data.requestMeta) : null
     );
 
     return data.id;
@@ -127,6 +187,44 @@ export function updateRecord(id, updates) {
         values.push(updates.durationMs);
     }
 
+    // === 3.7.0 错误诊断与追踪字段 ===
+    if (updates.workerName !== undefined) {
+        fields.push('worker_name = ?');
+        values.push(updates.workerName);
+    }
+    if (updates.adapterId !== undefined) {
+        fields.push('adapter_id = ?');
+        values.push(updates.adapterId);
+    }
+    if (updates.errorCode !== undefined) {
+        fields.push('error_code = ?');
+        values.push(updates.errorCode);
+    }
+    if (updates.errorStage !== undefined) {
+        fields.push('error_stage = ?');
+        values.push(updates.errorStage);
+    }
+    if (updates.errorStack !== undefined) {
+        fields.push('error_stack = ?');
+        values.push(updates.errorStack);
+    }
+    if (updates.attempts !== undefined) {
+        fields.push('attempts = ?');
+        values.push(Array.isArray(updates.attempts) ? JSON.stringify(updates.attempts) : updates.attempts);
+    }
+    if (updates.traceOps !== undefined) {
+        fields.push('trace_ops = ?');
+        values.push(Array.isArray(updates.traceOps) ? JSON.stringify(updates.traceOps) : updates.traceOps);
+    }
+    if (updates.traceSnaps !== undefined) {
+        fields.push('trace_snaps = ?');
+        values.push(Array.isArray(updates.traceSnaps) ? JSON.stringify(updates.traceSnaps) : updates.traceSnaps);
+    }
+    if (updates.requestMeta !== undefined) {
+        fields.push('request_meta = ?');
+        values.push(typeof updates.requestMeta === 'string' ? updates.requestMeta : JSON.stringify(updates.requestMeta));
+    }
+
     if (fields.length === 0) return;
 
     values.push(id);
@@ -156,8 +254,8 @@ export function getList(filters = {}, page = 1, pageSize = 20) {
         params.push(`%${filters.modelId}%`);
     }
     if (filters.search) {
-        conditions.push('(prompt LIKE ? OR response_text LIKE ?)');
-        params.push(`%${filters.search}%`, `%${filters.search}%`);
+        conditions.push('(prompt LIKE ? OR response_text LIKE ? OR error_message LIKE ?)');
+        params.push(`%${filters.search}%`, `%${filters.search}%`, `%${filters.search}%`);
     }
     if (filters.startDate) {
         conditions.push('created_at >= ?');
@@ -174,19 +272,17 @@ export function getList(filters = {}, page = 1, pageSize = 20) {
     const countStmt = db.prepare(`SELECT COUNT(*) as count FROM requests ${whereClause}`);
     const { count: total } = countStmt.get(...params);
 
-    // 获取分页数据
+    // 获取分页数据（列表不取大字段 trace_ops / trace_snaps / error_stack，详情接口再取）
     const offset = (page - 1) * pageSize;
     const dataStmt = db.prepare(`
-        SELECT * FROM requests ${whereClause}
+        SELECT id, created_at, model_id, model_name, prompt, input_images, response_text,
+               reasoning_content, response_media, status, error_message, duration_ms,
+               is_streaming, worker_name, adapter_id, error_code, error_stage, attempts, request_meta
+        FROM requests ${whereClause}
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
     `);
-    const items = dataStmt.all(...params, pageSize, offset).map(row => ({
-        ...row,
-        inputImages: row.input_images ? JSON.parse(row.input_images) : [],
-        responseMedia: row.response_media ? JSON.parse(row.response_media) : [],
-        isStreaming: row.is_streaming === 1
-    }));
+    const items = dataStmt.all(...params, pageSize, offset).map(mapRow);
 
     return { items, total, page, pageSize };
 }
@@ -203,12 +299,7 @@ export function getDetail(id) {
 
     if (!row) return null;
 
-    return {
-        ...row,
-        inputImages: row.input_images ? JSON.parse(row.input_images) : [],
-        responseMedia: row.response_media ? JSON.parse(row.response_media) : [],
-        isStreaming: row.is_streaming === 1
-    };
+    return mapRow(row);
 }
 
 /**
@@ -245,6 +336,9 @@ export async function deleteRecords(ids) {
             }
         }
     }
+
+    // 删除操作追踪截图目录（操作截图 + 周期快照）
+    await deleteTraceFiles(ids);
 
     // 删除数据库记录
     const deleteStmt = db.prepare(`DELETE FROM requests WHERE id IN (${placeholders})`);

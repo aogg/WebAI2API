@@ -174,7 +174,7 @@ export class PoolManager {
         let candidates = this.workers.filter(w => w.supports(modelId));
 
         if (candidates.length === 0) {
-            return { error: `没有 Worker 支持模型: ${modelId}` };
+            return { error: `没有 Worker 支持模型: ${modelId}`, code: 'NO_WORKER', retryable: false };
         }
 
         // 如果请求包含图片，优先选择 imagePolicy 为 optional 的 Worker
@@ -226,8 +226,81 @@ export class PoolManager {
             return await worker.generate(ctx, prompt, paths, modelId, meta);
         } catch (err) {
             logger.error('工作池', `[${worker.name}] 执行异常`, { error: err.message, ...meta });
-            return normalizeError(err.message || '执行异常');
+            const normalized = normalizeError(err.message || '执行异常');
+            normalized.worker = worker.name;
+            normalized.stack = err.stack || null;
+            return normalized;
         }
+    }
+
+    /**
+     * 重启浏览器（WebUI「重启浏览器」按钮）
+     * @param {string|null} [workerName] - 指定 Worker 名称；共享浏览器会随所有者一起重启。
+     *   null 时重启所有浏览器实例
+     * @returns {Promise<{success: boolean, results: object[]}>}
+     */
+    async restartBrowser(workerName = null) {
+        if (!this.initialized) {
+            throw new Error('工作池尚未初始化');
+        }
+
+        // 确定要重启的浏览器所有者集合
+        let owners;
+        if (workerName) {
+            const target = this.workers.find(w => w.name === workerName);
+            if (!target) {
+                throw new Error(`Worker 不存在: ${workerName}（可用: ${this.workers.map(w => w.name).join(', ')}）`);
+            }
+            // 共享者 → 重启其所有者（同一浏览器）
+            owners = [target._browserOwner || target];
+        } else {
+            owners = this.workers.filter(w => w._isBrowserOwner);
+            // 兜底：没有明确所有者时按 Worker 逐个重启
+            if (owners.length === 0) {
+                owners = this.workers;
+            }
+        }
+
+        const results = [];
+        for (const owner of owners) {
+            const entry = {
+                worker: owner.name,
+                shared: owner._sharedWorkers.map(w => w.name),
+                success: true,
+                error: null
+            };
+            try {
+                await owner.restartBrowser();
+                logger.info('工作池', `[${owner.name}] 浏览器重启成功`);
+            } catch (e) {
+                entry.success = false;
+                entry.error = e.message;
+                logger.error('工作池', `[${owner.name}] 浏览器重启失败: ${e.message}`);
+            }
+            results.push(entry);
+        }
+
+        return {
+            success: results.every(r => r.success),
+            results
+        };
+    }
+
+    /**
+     * 获取所有 Worker 运行状态（供 Admin API 展示）
+     * @returns {object[]}
+     */
+    getWorkersStatus() {
+        return this.workers.map(w => ({
+            name: w.name,
+            type: w.type,
+            instanceName: w.instanceName,
+            initialized: w.initialized,
+            busy: w.busyCount,
+            isBrowserOwner: !!w._isBrowserOwner,
+            sharedWith: w._sharedWorkers.map(s => s.name),
+            proxy: w.proxyConfig ? `${w.proxyConfig.type}://${w.proxyConfig.host}:${w.proxyConfig.port}` : null
+        }));
     }
 
     /**

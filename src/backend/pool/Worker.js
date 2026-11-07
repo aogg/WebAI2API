@@ -8,6 +8,7 @@ import { logger } from '../../utils/logger.js';
 import { initBrowserBase, createCursor } from '../engine/launcher.js';
 import { registry } from '../registry.js';
 import { tryGotoWithCheck } from '../utils/page.js';
+import { attachTrace, detachTrace, traceError, installPageTrace } from '../utils/trace.js';
 
 /**
  * Worker 类 - 封装单个浏览器实例
@@ -35,6 +36,9 @@ export class Worker {
         this.page = null;
         this.busyCount = 0;
         this.initialized = false;
+
+        // 手动重启标记：置位时浏览器 close 事件跳过自动恢复（由 restartBrowser 接管）
+        this._manualRestart = false;
 
         // 浏览器所有权（用于共享浏览器场景的协调重启）
         this._isBrowserOwner = false;  // 是否是浏览器的所有者（负责重启）
@@ -115,14 +119,7 @@ export class Worker {
         logger.info('工作池', `[${this.name}] 复用已有浏览器，创建新标签页...`);
         this.browser = sharedBrowser;
         this.page = await sharedBrowser.newPage();
-        this.page.authState = { isHandlingAuth: false };
-        this.page._browserMutex = this._browserMutex;
-        const humanizeCursorMode = this.globalConfig?.browser?.humanizeCursor;
-        this.page._humanizeCursorMode = humanizeCursorMode;
-        // true 表示使用项目维护的 ghost-cursor
-        if (humanizeCursorMode === true) {
-            this.page.cursor = createCursor(this.page);
-        }
+        this._setupPage(this.page, navigationHandler);
 
         // 保存参数用于重新初始化
         this._targetUrl = targetUrl;
@@ -130,16 +127,33 @@ export class Worker {
 
         await this._navigateToTarget(targetUrl);
 
-        if (navigationHandler) {
-            this.page.on('framenavigated', async () => {
-                try { await navigationHandler(this.page); } catch (e) { /* ignore */ }
-            });
-        }
-
         // 监听标签页关闭事件，自动重新创建（仅针对共享者）
         this._registerPageCloseHandler();
 
         logger.info('工作池', `[${this.name}] 初始化完成`);
+    }
+
+    /**
+     * 页面通用初始化（导航处理器 + 追踪包装器 + 拟人光标）
+     * @private
+     */
+    _setupPage(page, navigationHandler) {
+        page.authState = { isHandlingAuth: false };
+        const humanizeCursorMode = this.globalConfig?.browser?.humanizeCursor;
+        page._humanizeCursorMode = humanizeCursorMode;
+        // true 表示使用项目维护的 ghost-cursor
+        if (humanizeCursorMode === true) {
+            page.cursor = createCursor(page);
+        }
+
+        // 安装请求级操作追踪包装器（click/fill/type/press 等）
+        installPageTrace(page);
+
+        if (navigationHandler) {
+            page.on('framenavigated', async () => {
+                try { await navigationHandler(page); } catch (e) { /* ignore */ }
+            });
+        }
     }
 
     /**
@@ -170,19 +184,8 @@ export class Worker {
      */
     async _recreatePage() {
         this.page = await this.browser.newPage();
-        this.page.authState = { isHandlingAuth: false };
-        const humanizeCursorMode = this.globalConfig?.browser?.humanizeCursor;
-        this.page._humanizeCursorMode = humanizeCursorMode;
-        if (humanizeCursorMode === true) {
-            this.page.cursor = createCursor(this.page);
-        }
+        this._setupPage(this.page, this._navigationHandler);
         await this._navigateToTarget(this._targetUrl || 'about:blank');
-
-        if (this._navigationHandler) {
-            this.page.on('framenavigated', async () => {
-                try { await this._navigationHandler(this.page); } catch (e) { /* ignore */ }
-            });
-        }
 
         // 重新注册标签页关闭处理器
         this._registerPageCloseHandler();
@@ -204,18 +207,7 @@ export class Worker {
 
         this.browser = base.context;
         this.page = base.page;
-        this.page.authState = { isHandlingAuth: false };
-        const humanizeCursorMode = this.globalConfig?.browser?.humanizeCursor;
-        this.page._humanizeCursorMode = humanizeCursorMode;
-        if (humanizeCursorMode === true) {
-            this.page.cursor = createCursor(this.page);
-        }
-
-        if (navigationHandler) {
-            this.page.on('framenavigated', async () => {
-                try { await navigationHandler(this.page); } catch (e) { /* ignore */ }
-            });
-        }
+        this._setupPage(this.page, navigationHandler);
 
         // 保存 navigationHandler 用于重新初始化
         this._navigationHandler = navigationHandler;
@@ -235,6 +227,12 @@ export class Worker {
         } else {
             // 非登录模式：注册断开事件，所有者负责重启并同步到共享者
             this.browser.on('close', async () => {
+                // 手动重启流程接管时跳过自动恢复，避免双重启动
+                if (this._manualRestart) {
+                    logger.debug('工作池', `[${this.name}] 浏览器关闭事件（手动重启流程接管，跳过自动恢复）`);
+                    return;
+                }
+
                 logger.warn('工作池', `[${this.name}] 浏览器已断开连接，正在自动重新初始化...`);
 
                 // 标记自己和所有共享者为未初始化
@@ -252,25 +250,7 @@ export class Worker {
                     await this._reinit();
 
                     // 为所有共享者创建新的标签页
-                    for (const sharedWorker of this._sharedWorkers) {
-                        try {
-                            logger.info('工作池', `[${sharedWorker.name}] 正在恢复共享浏览器连接...`);
-                            sharedWorker.browser = this.browser;
-                            sharedWorker.page = await this.browser.newPage();
-                            sharedWorker.page.authState = { isHandlingAuth: false };
-                            const sharedCursorMode = this.globalConfig?.browser?.humanizeCursor;
-                            sharedWorker.page._humanizeCursorMode = sharedCursorMode;
-                            if (sharedCursorMode === true) {
-                                sharedWorker.page.cursor = createCursor(sharedWorker.page);
-                            }
-                            await sharedWorker._navigateToTarget(sharedWorker._targetUrl || 'about:blank');
-                            sharedWorker._registerPageCloseHandler();  // 重新注册标签页关闭处理器
-                            sharedWorker.initialized = true;
-                            logger.info('工作池', `[${sharedWorker.name}] 共享浏览器连接已恢复`);
-                        } catch (e) {
-                            logger.error('工作池', `[${sharedWorker.name}] 恢复共享浏览器连接失败: ${e.message}`);
-                        }
-                    }
+                    await this._restoreSharedWorkers();
                 } catch (e) {
                     logger.error('工作池', `[${this.name}] 自动重新初始化失败: ${e.message}`);
                 }
@@ -281,6 +261,27 @@ export class Worker {
         }
 
         logger.info('工作池', `[${this.name}] 初始化完成`);
+    }
+
+    /**
+     * 为所有共享者重新创建标签页（自动恢复与手动重启共用）
+     * @private
+     */
+    async _restoreSharedWorkers() {
+        for (const sharedWorker of this._sharedWorkers) {
+            try {
+                logger.info('工作池', `[${sharedWorker.name}] 正在恢复共享浏览器连接...`);
+                sharedWorker.browser = this.browser;
+                sharedWorker.page = await this.browser.newPage();
+                sharedWorker._setupPage(sharedWorker.page, sharedWorker._navigationHandler);
+                await sharedWorker._navigateToTarget(sharedWorker._targetUrl || 'about:blank');
+                sharedWorker._registerPageCloseHandler();  // 重新注册标签页关闭处理器
+                sharedWorker.initialized = true;
+                logger.info('工作池', `[${sharedWorker.name}] 共享浏览器连接已恢复`);
+            } catch (e) {
+                logger.error('工作池', `[${sharedWorker.name}] 恢复共享浏览器连接失败: ${e.message}`);
+            }
+        }
     }
 
     /**
@@ -406,9 +407,12 @@ export class Worker {
         const maxAttempts = maxRetries === 0 ? candidateTypes.length : Math.min(maxRetries + 1, candidateTypes.length);
         let lastError = null;
         let lastRetryable = undefined;
+        /** @type {object[]} 适配器级尝试链（用于历史记录错误诊断） */
+        const adapterAttempts = [];
 
         for (let i = 0; i < maxAttempts; i++) {
             const { type, modelId: actualModelId } = candidateTypes[i];
+            const attemptStart = Date.now();
             const result = await this._executeAdapter(ctx, type, actualModelId, prompt, paths, meta);
 
             if (!result.error) {
@@ -418,9 +422,22 @@ export class Worker {
             lastError = result.error;
             lastRetryable = result.retryable;
 
+            // 记录适配器级尝试
+            adapterAttempts.push({
+                index: i + 1,
+                worker: this.name,
+                adapter: type,
+                model: actualModelId,
+                error: String(lastError).slice(0, 1000),
+                code: result.code || null,
+                retryable: result.retryable,
+                durationMs: Date.now() - attemptStart,
+                at: attemptStart
+            });
+
             // 如果明确标记为不可重试（如内容安全问题），立即返回
             if (result.retryable === false) {
-                return { error: `所有支持该模型的适配器都无法使用: ${lastError}`, retryable: false };
+                return { error: `所有支持该模型的适配器都无法使用: ${lastError}`, retryable: false, attempts: adapterAttempts };
             }
 
             if (i < maxAttempts - 1) {
@@ -428,7 +445,11 @@ export class Worker {
             }
         }
 
-        return { error: `所有支持该模型的适配器都无法使用: ${lastError}`, retryable: lastRetryable };
+        return {
+            error: `所有支持该模型的适配器都无法使用: ${lastError}`,
+            retryable: lastRetryable,
+            attempts: adapterAttempts
+        };
     }
 
     /**
@@ -468,13 +489,13 @@ export class Worker {
                 await this._reinit();
             } catch (e) {
                 logger.error('工作池', `[${this.name}] 重新初始化失败`, { error: e.message, ...meta });
-                return { error: `Worker 重新初始化失败: ${e.message}` };
+                return { error: `Worker 重新初始化失败: ${e.message}`, adapter: type, model: modelId };
             }
         }
 
         const adapter = registry.getAdapter(type);
         if (!adapter) {
-            return { error: `适配器不存在: ${type}` };
+            return { error: `适配器不存在: ${type}`, adapter: type, model: modelId };
         }
 
         logger.info('工作池', `[${this.name}] 执行任务 -> ${type}/${modelId}`, meta);
@@ -490,11 +511,38 @@ export class Worker {
         // 扩展 meta，添加 adapter 和 model 信息
         const enrichedMeta = { ...meta, adapter: type, model: modelId };
 
+        // 将本页挂到请求级追踪（携带 worker/adapter/model 标签）
+        attachTrace(this.page, { requestId: meta?.id, worker: this.name, adapter: type, model: modelId });
+
         this.busyCount++;
         try {
             // 传递原始 modelId，由适配器自己解析
-            return await adapter.generate(subContext, prompt, paths, modelId, enrichedMeta);
+            const result = await adapter.generate(subContext, prompt, paths, modelId, enrichedMeta);
+
+            // 失败结果补齐 worker/adapter/model，并记录到操作日志
+            if (result?.error) {
+                result.worker = result.worker || this.name;
+                result.adapter = result.adapter || type;
+                result.model = result.model || modelId;
+                traceError(this.page, '适配器返回错误', result.error, {
+                    detail: `${type}/${modelId}`,
+                    screenshot: false
+                });
+            } else if (result) {
+                result.worker = result.worker || this.name;
+                result.adapter = result.adapter || type;
+                result.model = result.model || modelId;
+            }
+
+            return result;
+        } catch (err) {
+            traceError(this.page, '适配器执行异常', err, {
+                detail: `${type}/${modelId}`,
+                screenshot: false
+            });
+            throw err;
         } finally {
+            detachTrace(this.page);
             this.busyCount--;
         }
     }
@@ -512,6 +560,52 @@ export class Worker {
         await this._initNewBrowser(this._targetUrl || 'about:blank', this._navigationHandler || null);
         this.initialized = true;
         logger.info('工作池', `[${this.name}] 浏览器已成功重新初始化`);
+    }
+
+    /**
+     * 手动重启浏览器（WebUI「重启浏览器」按钮）
+     * 关闭当前浏览器实例并重新初始化；若是浏览器所有者，会协调所有共享 Worker 一起恢复。
+     * 忙碌时抛错，避免打断正在执行的请求。
+     */
+    async restartBrowser() {
+        const all = [this, ...this._sharedWorkers];
+        const busy = all.find(w => w.busyCount > 0);
+        if (busy) {
+            throw new Error(`Worker [${busy.name}] 正在执行任务 (busy=${busy.busyCount})，请稍后再试`);
+        }
+
+        this._manualRestart = true;
+        try {
+            logger.info('工作池', `[${this.name}] 手动重启浏览器（含 ${this._sharedWorkers.length} 个共享 Worker）...`);
+
+            // 标记所有相关 Worker 为未初始化
+            for (const w of all) {
+                w.initialized = false;
+            }
+
+            // 关闭旧浏览器（持久化上下文关闭即退出浏览器进程）
+            try {
+                await this.browser?.close();
+            } catch (e) {
+                logger.debug('工作池', `[${this.name}] 关闭旧浏览器时出现异常（忽略）: ${e.message}`);
+            }
+            this.browser = null;
+            this.page = null;
+            for (const w of this._sharedWorkers) {
+                w.browser = null;
+                w.page = null;
+            }
+
+            // 所有者重新初始化浏览器（重新注册 close/page 事件处理器）
+            await this._reinit();
+
+            // 恢复所有共享 Worker 的标签页
+            await this._restoreSharedWorkers();
+
+            logger.info('工作池', `[${this.name}] 手动重启完成`);
+        } finally {
+            this._manualRestart = false;
+        }
     }
 
     /**

@@ -5,6 +5,8 @@
 
 import { sleep, safeClick, isPageValid, createPageCloseWatcher, getRealViewport, clamp, random } from '../engine/utils.js';
 import { TIMEOUTS } from '../../utils/constants.js';
+import { logger } from '../../utils/logger.js';
+import { traceOp, traceError } from './trace.js';
 
 // ==========================================
 // 页面认证锁
@@ -78,10 +80,20 @@ export async function waitForInput(page, selectorOrLocator, options = {}) {
     // 等待输入框出现
     if (isLocator) {
         await selectorOrLocator.first().waitFor({ state: 'visible', timeout: remainingTimeout }).catch(() => {
+            traceError(page, '定位输入框', new Error(`未找到输入框 (${displayName})`), {
+                selector: displayName,
+                durationMs: Date.now() - startTime,
+                screenshot: false
+            });
             throw new Error(`未找到输入框 (${displayName})`);
         });
     } else {
         await page.waitForSelector(selectorOrLocator, { timeout: remainingTimeout }).catch(() => {
+            traceError(page, '定位输入框', new Error(`未找到输入框 (${displayName})`), {
+                selector: displayName,
+                durationMs: Date.now() - startTime,
+                screenshot: false
+            });
             throw new Error(`未找到输入框 (${displayName})`);
         });
     }
@@ -89,12 +101,30 @@ export async function waitForInput(page, selectorOrLocator, options = {}) {
     if (click) {
         await safeClick(page, selectorOrLocator, { bias: 'input' });
         await sleep(500, 1000);
+        // 点击时 safeClick 已截图，这里只补一条定位日志
+        traceOp(page, '定位输入框', `${displayName}（已点击聚焦）`, {
+            selector: displayName,
+            durationMs: Date.now() - startTime,
+            screenshot: false
+        });
+    } else {
+        traceOp(page, '定位输入框', displayName, {
+            selector: displayName,
+            durationMs: Date.now() - startTime
+        });
     }
 }
 
 // ==========================================
 // 导航与鼠标
 // ==========================================
+
+/**
+ * 导航期可重试的网络层错误
+ * 代理（gost/clash 中转）在空闲后可能主动断开隧道，浏览器复用旧连接时
+ * 会立刻抛 NS_ERROR_NET_INTERRUPT / PR_END_OF_FILE_ERROR，重试即可恢复。
+ */
+const RETRYABLE_NAV_ERROR = /NS_ERROR_NET_INTERRUPT|NS_ERROR_NET_RESET|NS_ERROR_NET_TIMEOUT|NS_ERROR_ABORT|PR_END_OF_FILE_ERROR|PR_CONNECT_RESET_ERROR|Secure Connection Failed|connection (?:was )?(?:reset|aborted)|socket hang up|ECONNRESET/i;
 
 /**
  * 导航到指定 URL 并检测 HTTP 错误
@@ -105,34 +135,72 @@ export async function waitForInput(page, selectorOrLocator, options = {}) {
  * @throws {Error} 导航失败时抛出错误
  */
 export async function gotoWithCheck(page, url, options = {}) {
-    const { timeout = TIMEOUTS.NAVIGATION } = options;
-    try {
-        const response = await page.goto(url, {
-            waitUntil: 'load',
-            timeout
-        });
-        if (!response) {
-            throw new Error('页面加载失败: 无响应');
+    const {
+        timeout = TIMEOUTS.NAVIGATION,
+        waitUntil = 'load',
+        attempts = 3,
+        retryDelay = [800, 2000],
+        meta = {}
+    } = options;
+
+    let lastErr = null;
+    const navStart = Date.now();
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        if (!isPageValid(page)) {
+            throw new Error('PAGE_INVALID');
         }
-        const status = response.status();
-        if (status >= 400) {
-            throw new Error(`网站无法访问 (HTTP ${status})`);
+        try {
+            const response = await page.goto(url, { waitUntil, timeout });
+            if (!response) {
+                throw new Error('页面加载失败: 无响应');
+            }
+            const status = response.status();
+            if (status >= 400) {
+                throw new Error(`网站无法访问 (HTTP ${status})`);
+            }
+
+            // 操作追踪：导航成功
+            traceOp(page, '页面导航', url, {
+                url,
+                durationMs: Date.now() - navStart,
+                extra: { httpStatus: status }
+            });
+
+            return response;
+        } catch (e) {
+            lastErr = e;
+            const message = String(e?.message || e);
+            const isTimeout = /Timeout|timed out/i.test(message);
+            const retryable = isTimeout || RETRYABLE_NAV_ERROR.test(message);
+            if (!retryable || attempt >= attempts) break;
+            logger.warn('页面', `导航失败（第 ${attempt}/${attempts} 次，${isTimeout ? '超时' : '连接中断'}），正在重试: ${message.split('\n')[0]}`, meta);
+            const delay = retryDelay[Math.min(attempt - 1, retryDelay.length - 1)];
+            await sleep(delay, delay + 600);
         }
-    } catch (e) {
-        if (e.message.includes('Timeout')) {
-            throw new Error('页面加载超时');
-        }
-        // 如果是我们自己抛出的错误，直接 re-throw
-        if (e.message.startsWith('页面') || e.message.startsWith('网站')) {
-            throw e;
-        }
-        throw new Error(`页面加载失败: ${e.message}`);
     }
+
+    // 操作追踪：导航失败
+    traceError(page, '页面导航', lastErr || new Error('未知错误'), {
+        detail: url,
+        url,
+        durationMs: Date.now() - navStart,
+        screenshot: false
+    });
+
+    const message = String(lastErr?.message || lastErr || '未知错误');
+    if (/Timeout|timed out/i.test(message)) {
+        throw new Error('页面加载超时');
+    }
+    if (message.startsWith('页面') || message.startsWith('网站')) {
+        throw lastErr;
+    }
+    throw new Error(`页面加载失败: ${message}`);
 }
 
 /**
  * 尝试导航到 URL（不抛异常版本，用于需要收集错误的场景）
- * @param {import('playwright-core').Page} page - 页面对象
+ * @param {import('playwright-core').Page} page - Playwright 页面对象
  * @param {string} url - 目标 URL
  * @param {object} [options={}] - 选项
  * @returns {Promise<{success?: boolean, error?: string}>}
@@ -210,6 +278,7 @@ export function waitApiResponse(page, options = {}) {
 
     const pageWatcher = createPageCloseWatcher(page);
     const patterns = errorText ? (Array.isArray(errorText) ? errorText : [errorText]) : [];
+    const waitStart = Date.now();
 
     // 页面 UI 错误关键词检测
     let uiErrorPromise = null;
@@ -223,6 +292,11 @@ export function waitApiResponse(page, options = {}) {
             uiErrorPromise = combinedLocator.first().waitFor({ timeout, state: 'attached' })
                 .then(async () => {
                     const matchedText = await combinedLocator.first().textContent().catch(() => '未知错误');
+                    // 操作追踪：页面 UI 检测到错误关键词
+                    traceError(page, '页面UI检测到错误', new Error(matchedText), {
+                        detail: `关键词命中: ${matchedText}`,
+                        screenshot: true
+                    });
                     throw new Error(`PAGE_ERROR_DETECTED: ${matchedText}`);
                 });
         }
@@ -272,6 +346,14 @@ export function waitApiResponse(page, options = {}) {
                 // 匹配成功，移除监听器（只处理第一个匹配的响应）
                 page.off('response', responseHandler);
                 responseHandler = null;
+
+                // 操作追踪：捕获到匹配的 API 响应
+                traceOp(page, '捕获API响应', url, {
+                    url,
+                    durationMs: Date.now() - waitStart,
+                    extra: { httpStatus: status },
+                    screenshot: false
+                });
 
                 // 统一等待请求完成（无论流式还是非流式）
                 // 使用 timeout 作为空闲超时，防止连接卡住无限等待
@@ -329,6 +411,14 @@ export function waitApiResponse(page, options = {}) {
                 for (const pattern of patterns) {
                     const keyword = typeof pattern === 'string' ? pattern : pattern.source;
                     if (body.includes(keyword)) {
+                        // 操作追踪：API 响应体命中错误关键词（截取片段辅助排查）
+                        traceError(page, 'API响应包含错误', new Error(`API_ERROR_DETECTED: ${keyword}`), {
+                            detail: `关键词命中: ${keyword}`,
+                            extra: {
+                                responseSnippet: body.slice(0, 500)
+                            },
+                            screenshot: false
+                        });
                         throw new Error(`API_ERROR_DETECTED: ${keyword}`);
                     }
                 }
@@ -347,7 +437,21 @@ export function waitApiResponse(page, options = {}) {
     } catch (e) {
         // 检测超时错误，转换为标准错误类型
         if (e.name === 'TimeoutError' || e.message?.includes('TIMEOUT')) {
+            // 操作追踪：等待 API 响应超时
+            traceError(page, '等待API响应超时', e, {
+                detail: `匹配: ${urlMatch}`,
+                durationMs: Date.now() - waitStart,
+                screenshot: true
+            });
             throw new Error(`API_TIMEOUT: ${e.message}`);
+        }
+        if (e.message?.startsWith('NETWORK_FAILED')) {
+            // 操作追踪：网络请求失败
+            traceError(page, 'API网络请求失败', e, {
+                detail: `匹配: ${urlMatch}`,
+                durationMs: Date.now() - waitStart,
+                screenshot: false
+            });
         }
         throw e;
     } finally {
@@ -362,4 +466,3 @@ export function waitApiResponse(page, options = {}) {
 
     return promise;
 }
-
