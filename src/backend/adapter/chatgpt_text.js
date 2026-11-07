@@ -13,11 +13,15 @@ import {
     waitForInput,
     gotoWithCheck
 } from '../utils/index.js';
+import fs from 'fs';
 import { logger } from '../../utils/logger.js';
+import { TIMEOUTS } from '../../utils/constants.js';
 
 // --- 配置常量 ---
 const TARGET_URL = 'https://chatgpt.com/'; // 基础URL
 const INPUT_SELECTOR = '.ProseMirror';
+// 新版 ChatGPT 页面用 CSS Modules 类名渲染 markdown 内容，用属性片段匹配更稳妥
+const ASSISTANT_SELECTOR = '[class*="MarkdownRoot"], [data-message-author-role="assistant"], article';
 
 /**
  * 通过 UI 选择模型
@@ -86,6 +90,70 @@ async function selectModel(page, codeName, meta = {}) {
 }
 
 /**
+ * 准备一个可用的新对话页面
+ * 整页 goto 在慢代理下容易超时或被隧道中断，这里优先复用已经打开的应用，
+ * 只有页面不可用时才真正导航（导航带重试）。
+ * @param {import('playwright-core').Page} page - 页面对象
+ * @param {string} targetUrl - 目标 URL
+ * @param {{meta?: object, forceGoto?: boolean}} [options]
+ * @returns {Promise<void>}
+ */
+async function waitComposer(page, timeout = 20000) {
+    try {
+        await page.waitForSelector(INPUT_SELECTOR, { timeout, state: 'visible' });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function ensureNewChatSurface(page, targetUrl, options = {}) {
+    const { meta = {}, forceGoto = false } = options;
+    const onChatGpt = () => /^https?:\/\/chatgpt\.com(\/|$|\?)/i.test(page.url() || '');
+
+    const reload = async (reason) => {
+        logger.info('适配器', `重新加载 ChatGPT 页面（${reason}）`, meta);
+        await gotoWithCheck(page, targetUrl, {
+            timeout: TIMEOUTS.NAVIGATION_EXTENDED,
+            waitUntil: 'domcontentloaded',
+            attempts: 3,
+            meta
+        });
+        return waitComposer(page, 30000);
+    };
+
+    let ready = false;
+    if (onChatGpt() && !forceGoto) {
+        ready = await waitComposer(page, 15000);
+    }
+
+    if (!ready) {
+        ready = await reload('输入框不可用');
+    }
+
+    if (forceGoto) return;
+
+    if (!ready) {
+        logger.warn('适配器', '页面输入框仍不可用，继续尝试发送', meta);
+        return;
+    }
+
+    // 开启新会话：优先点侧边栏 New chat（避免整页重载），失败再重载页面兜底
+    const newChatBtn = page.getByRole('link', { name: /New chat|新聊天|新建聊天/i })
+        .or(page.getByRole('button', { name: /New chat|新聊天|新建聊天/i }));
+    if (await newChatBtn.count().catch(() => 0)) {
+        logger.info('适配器', '点击“New chat”开启新会话', meta);
+        await safeClick(page, newChatBtn.first(), { bias: 'button' }).catch(() => { });
+        await sleep(700, 1200);
+        const ok = await waitComposer(page, 15000);
+        if (!ok) {
+            logger.warn('适配器', '点击 New chat 后输入框不可用，重新加载页面', meta);
+            await reload('New chat 后输入框不可用');
+        }
+    }
+}
+
+/**
  * 执行文本生成任务
  * @param {object} context - 浏览器上下文 { page, config }
  * @param {string} prompt - 提示词
@@ -96,14 +164,13 @@ async function selectModel(page, codeName, meta = {}) {
  */
 async function generate(context, prompt, imgPaths, modelId, meta = {}) {
     const { page, config } = context;
+
     const waitTimeout = config?.backend?.pool?.waitTimeout ?? 120000;
-    const sendBtnLocator = page.getByRole('button', { name: 'Send prompt' });
 
     try {
         const useTemp = config?.backend?.adapter?.chatgpt_text?.temporaryChat || false;
         const targetUrl = useTemp ? 'https://chatgpt.com/?temporary-chat=true' : 'https://chatgpt.com/'; // 感谢 @zhongjianhua163 提供临时对话方案
-        logger.info('适配器', '开启新会话...', meta);
-        await gotoWithCheck(page, targetUrl);
+        await ensureNewChatSurface(page, targetUrl, { meta, forceGoto: useTemp });
 
         // 1. 等待输入框加载
         await waitForInput(page, INPUT_SELECTOR, { click: false });
@@ -154,187 +221,30 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             }, meta);
         }
 
-        // 3. 输入提示词
+        // 4. 输入提示词
         logger.info('适配器', '输入提示词...', meta);
         await safeClick(page, INPUT_SELECTOR, { bias: 'input' });
         await humanType(page, INPUT_SELECTOR, prompt);
 
-        // 4. 先启动 SSE 监听，再发送提示词（避免竞态）
-        logger.info('适配器', '监听 SSE 流获取文本...', meta);
+        // 5. 记录已有回复数量（确保只取本次新产生的回复）
+        const assistantCountBefore = await page
+            .evaluate(() => Array.from(document.querySelectorAll(ASSISTANT_SELECTOR))
+                .filter((el) => (el.innerText || '').trim().length > 0).length)
+            .catch(() => 0);
 
-        let textContent = '';
-        let isComplete = false;
-        let targetMessageId = null;  // 只追踪 channel: "final" 的消息
-
-        const responsePromise = page.waitForResponse(async (response) => {
-            const url = response.url();
-            if (!url.includes('backend-api/f/conversation')) return false;
-            if (response.request().method() !== 'POST') return false;
-            if (response.status() !== 200) return false;
-
-            try {
-                const body = await response.text();
-                const lines = body.split('\n');
-
-                for (const line of lines) {
-                    // 跳过空行和事件行
-                    if (!line.startsWith('data: ')) continue;
-
-                    const dataStr = line.slice(6).trim();
-                    if (dataStr === '[DONE]') {
-                        isComplete = true;
-                        continue;
-                    }
-
-                    try {
-                        const data = JSON.parse(dataStr);
-
-                        // 检测目标消息 (assistant 角色, channel: "final", content_type: "text")
-                        if (data.v?.message?.author?.role === 'assistant' &&
-                            data.v?.message?.channel === 'final' &&
-                            data.v?.message?.content?.content_type === 'text') {
-                            targetMessageId = data.v.message.id;
-                            // 重置内容（即使 parts[0] 为空也要重置，清除之前 commentary 的文本）
-                            const parts = data.v.message.content.parts;
-                            textContent = (parts && parts[0]) || '';
-                        }
-
-                        // 以下所有内容累积都必须在 targetMessageId 设置之后才执行
-                        // 避免误收 commentary / thinking 频道的内容
-                        if (!targetMessageId) continue;
-
-                        // 累积 delta 内容 (append 操作，顶层 path)
-                        if (data.o === 'append' && data.p === '/message/content/parts/0' && data.v) {
-                            textContent += data.v;
-                        }
-
-                        // patch 操作中的 append (数组格式)
-                        if (Array.isArray(data.v)) {
-                            for (const patch of data.v) {
-                                if (patch.o === 'append' && patch.p === '/message/content/parts/0' && patch.v) {
-                                    textContent += patch.v;
-                                }
-                                // 仅在 targetMessageId 存在时检查完成
-                                if (patch.p === '/message/status' && patch.v === 'finished_successfully') {
-                                    isComplete = true;
-                                }
-                            }
-                        }
-
-                        // message_stream_complete 表示完成
-                        if (data.type === 'message_stream_complete') {
-                            isComplete = true;
-                        }
-                    } catch {
-                        // 忽略解析错误
-                    }
-                }
-
-                return isComplete;
-            } catch {
-                return false;
-            }
-        }, { timeout: waitTimeout });
-
-        // 5. 发送提示词
+        // 6. 发送提示词
         logger.debug('适配器', '发送提示词...', meta);
         await page.keyboard.press('Enter');
-
         logger.info('适配器', '等待生成结果...', meta);
 
-        // 6. 等待 SSE 响应完成
-        try {
-            await responsePromise;
-        } catch (e) {
-            const pageError = normalizePageError(e, meta);
-            if (pageError) return pageError;
-            throw e;
-        }
-
-        if (!textContent || textContent.trim() === '') {
-            logger.warn('适配器', 'SSE 未解析到文本，尝试 DOM 回退提取...', meta);
-            try {
-                const domWaitTimeout = Math.min(waitTimeout, 60000);
-                const extractAssistantText = () => {
-                    const rejectExact = new Set(['Thinking', 'Instant', 'Pro', 'ChatGPT']);
-                    const clean = (value) => (value || '')
-                        .replace(/^ChatGPT said:\s*/i, '')
-                        .replace(/\u00a0/g, ' ')
-                        .trim();
-                    const acceptable = (value) => {
-                        const text = clean(value);
-                        if (!text || rejectExact.has(text)) return '';
-                        if (/^(Thinking|Instant|Pro)\s*$/i.test(text)) return '';
-                        if (/^\d+\s*\/\s*\d+$/.test(text)) return '';
-                        return text;
-                    };
-
-                    const nodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
-                    for (let i = nodes.length - 1; i >= 0; i--) {
-                        const node = nodes[i];
-                        const preferred = Array.from(node.querySelectorAll('.markdown, .prose, [data-message-content-part]'));
-                        for (let j = preferred.length - 1; j >= 0; j--) {
-                            const text = acceptable(preferred[j].innerText || preferred[j].textContent);
-                            if (text) return text;
-                        }
-
-                        const lines = clean(node.innerText || node.textContent)
-                            .split('\n')
-                            .map(line => clean(line))
-                            .filter(Boolean)
-                            .filter(line => !rejectExact.has(line));
-                        const text = acceptable(lines.join('\n'));
-                        if (text) return text;
-                    }
-                    return '';
-                };
-
-                const isGenerating = () => {
-                    const text = document.body.innerText || '';
-                    if (/Thinking\.\.\.|Thinking…|正在思考|思考中/.test(text)) return true;
-                    const buttons = Array.from(document.querySelectorAll('button'));
-                    return buttons.some((button) => {
-                        const label = `${button.getAttribute('aria-label') || ''} ${button.innerText || button.textContent || ''}`;
-                        return /stop generating|stop streaming|停止生成|停止回答|cancel/i.test(label);
-                    });
-                };
-
-                await page.waitForFunction(extractAssistantText, null, { timeout: domWaitTimeout }).catch(() => { });
-
-                let domText = '';
-                let lastText = '';
-                let stableCount = 0;
-                const stableStartedAt = Date.now();
-                while (Date.now() - stableStartedAt < domWaitTimeout) {
-                    const currentText = await page.evaluate(extractAssistantText);
-                    const generating = await page.evaluate(isGenerating).catch(() => false);
-                    if (currentText && currentText === lastText && !generating) {
-                        stableCount++;
-                    } else {
-                        stableCount = 0;
-                        lastText = currentText || lastText || '';
-                    }
-
-                    if (lastText && !generating && stableCount >= 8) {
-                        domText = lastText;
-                        break;
-                    }
-
-                    await sleep(1200, 1600);
-                }
-
-                if (!domText) {
-                    domText = lastText || await page.evaluate(extractAssistantText);
-                }
-
-                if (domText && domText.trim()) {
-                    textContent = domText.trim();
-                    logger.info('适配器', `DOM 回退提取文本成功 (${textContent.length} 字符)`, meta);
-                }
-            } catch (e) {
-                logger.warn('适配器', `DOM 回退提取失败: ${e.message}`, meta);
-            }
-        }
+        // 7. 以页面 DOM 为准提取回复
+        // 说明：网页私有的 SSE 增量协议（channel/append path 等）会随版本变更，解析极易失效；
+        // 页面渲染出来的内容才是最终结果，这里改为等待 DOM 稳定后整段读取。
+        const textContent = await waitAssistantReply(page, {
+            assistantCountBefore,
+            timeout: Math.min(waitTimeout, 180000),
+            meta
+        });
 
         if (!textContent || textContent.trim() === '') {
             logger.warn('适配器', '回复内容为空', meta);
@@ -353,6 +263,115 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         logger.error('适配器', '生成任务失败', { ...meta, error: err.message });
         return { error: `生成任务失败: ${err.message}` };
     } finally { }
+}
+
+/**
+ * 等待并提取本次新产生的 assistant 回复（以页面渲染结果为准）
+ * @param {import('playwright-core').Page} page - 页面对象
+ * @param {{assistantCountBefore?: number, timeout?: number, meta?: object}} [options]
+ * @returns {Promise<string>} 回复文本（超时则返回已捕获的最长内容）
+ */
+async function waitAssistantReply(page, options = {}) {
+    const { assistantCountBefore = 0, timeout = 180000, meta = {} } = options;
+    const startedAt = Date.now();
+    let lastText = '';
+    let stableCount = 0;
+    let longest = '';
+    let pollCount = 0;
+
+    while (Date.now() - startedAt < timeout) {
+        pollCount++;
+        const snapshot = await page.evaluate(([before, selector]) => {
+            const nodes = Array.from(document.querySelectorAll(selector))
+                .filter((el) => (el.innerText || '').trim().length > 0);
+            if (nodes.length <= before) {
+                return { text: '', generating: true, hasActions: false };
+            }
+            const node = nodes[nodes.length - 1];
+            const text = (node.innerText || node.textContent || '').trim();
+
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const generating = buttons.some((button) => {
+                const label = `${button.getAttribute('aria-label') || ''} ${button.innerText || button.textContent || ''}`;
+                return /stop generating|stop streaming|停止生成|停止回答/i.test(label);
+            });
+            const messageRoot = node.closest('[class*="turn"], [class*="message"], div') || node;
+            const hasActions = !!messageRoot.querySelector('button[aria-label*="Copy" i], button[aria-label*="复制"], [data-testid="copy-turn-action-button"]');
+            return { text, generating, hasActions };
+        }, [assistantCountBefore, ASSISTANT_SELECTOR]).catch(() => ({ text: '', generating: true, hasActions: false }));
+
+        const text = (snapshot.text || '')
+            .replace(/^ChatGPT said:\s*/i, '')
+            .replace(/\u00a0/g, ' ')
+            .trim();
+
+        if (text.length > longest.length) {
+            longest = text;
+        }
+
+        if (text) {
+            if (text === lastText) {
+                stableCount++;
+            } else {
+                stableCount = 0;
+                lastText = text;
+            }
+
+            if (stableCount >= 2 && (!snapshot.generating || snapshot.hasActions)) {
+                logger.debug('适配器', `回复已稳定（轮询 ${pollCount} 次）`, meta);
+                return text;
+            }
+            if (stableCount >= 3 && !snapshot.generating) {
+                return text;
+            }
+        }
+
+        await sleep(900, 1300);
+    }
+
+    if (longest) {
+        logger.warn('适配器', `等待回复超时，改用已捕获的部分内容 (${longest.length} 字符)`, meta);
+        return longest;
+    }
+
+    // 调试：定位不到回复时落盘页面结构，便于适配新版页面
+    try {
+        const dump = await page.evaluate(() => {
+            const main = document.querySelector('main') || document.body;
+            const chains = [];
+            const walker = document.createTreeWalker(main, NodeFilter.SHOW_TEXT);
+            let node;
+            while ((node = walker.nextNode())) {
+                const text = (node.textContent || '').trim();
+                if (!text || text.length < 1) continue;
+                let el = node.parentElement;
+                const chain = [];
+                for (let i = 0; i < 7 && el; i++, el = el.parentElement) {
+                    chain.push([
+                        el.tagName.toLowerCase(),
+                        el.getAttribute('data-testid') || '',
+                        el.getAttribute('data-message-author-role') || '',
+                        el.getAttribute('data-talvt-turn-state') || '',
+                        String(el.className || '').slice(0, 70)
+                    ].join('|'));
+                }
+                chains.push({ text: text.slice(0, 60), chain });
+                if (chains.length > 60) break;
+            }
+            return {
+                url: location.href,
+                text: (main.innerText || '').slice(0, 4000),
+                chains,
+                html: main.innerHTML.slice(0, 4000)
+            };
+        });
+        if (fs.existsSync('/app/data/temp')) {
+            fs.writeFileSync('/app/data/temp/chatgpt_dom_debug.txt',
+                `URL:\n${dump.url}\n\nTEXT:\n${dump.text}\n\nCHAINS:\n${JSON.stringify(dump.chains, null, 2)}\n\nHTML-HEAD:\n${dump.html}`);
+        }
+    } catch { /* ignore */ }
+
+    return '';
 }
 
 /**
