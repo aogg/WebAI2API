@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue';
+import { ref, onMounted, onUnmounted, watch } from 'vue';
 import { useSettingsStore } from '@/stores/settings';
 import { message, Modal } from 'ant-design-vue';
 import {
@@ -24,6 +24,13 @@ const isFullscreen = ref(false);
 
 // 重启浏览器状态
 const restarting = ref(false);
+
+// 剪贴板自动共享（本机 ⇄ 远程 双向同步）
+const clipboardShareEnabled = ref(localStorage.getItem('vncClipboardShare') === '1'); // 开关状态持久化到 localStorage
+const clipboardShareSuspended = ref(false); // true = 剪贴板授权被拒后轮询已暂停，等待用户授权后恢复
+let clipboardPollTimer = null;   // 共享轮询定时器
+let lastPushedText = '';         // 最近一次推送/接收的剪贴板文本，防止双向同步互相回推（防回环）
+let clipboardPermWarned = false; // 授权被拒的警告只弹一次
 
 // 剪贴板状态
 const pasteModalVisible = ref(false);
@@ -84,6 +91,11 @@ async function connectVnc() {
         rfb.addEventListener('connect', () => {
             connectionState.value = 'connected';
             message.success('VNC 已连接，可直接 Ctrl+V 粘贴或使用"粘贴"按钮');
+            // 剪贴板共享开关开启时：连接成功立即尝试一次读取并启动轮询
+            //（此刻处于"连接"按钮的用户手势链路上，便于触发浏览器剪贴板授权）
+            if (clipboardShareEnabled.value) {
+                startClipboardPolling();
+            }
         });
 
         rfb.addEventListener('disconnect', (e) => {
@@ -91,6 +103,7 @@ async function connectVnc() {
             if (e.detail.clean === false) {
                 errorMessage.value = '连接意外断开';
             }
+            stopClipboardPolling();
             rfb = null;
         });
 
@@ -104,6 +117,8 @@ async function connectVnc() {
             if (!text) return;
             try {
                 await navigator.clipboard.writeText(text);
+                // 防回环：远程推来的文本记为 lastPushedText，避免轮询又把同一文本推回远程
+                lastPushedText = text;
             } catch (err) {
                 console.debug('远程剪贴板写入本地失败（需 HTTPS）', err);
             }
@@ -117,6 +132,7 @@ async function connectVnc() {
 
 // 断开连接
 function disconnectVnc() {
+    stopClipboardPolling();
     if (rfb) {
         rfb.disconnect();
         rfb = null;
@@ -176,6 +192,12 @@ async function pasteToRemote() {
             return;
         }
         if (sendToRemoteClipboard(text)) {
+            lastPushedText = text; // 防回环：刚推送的内容不再被轮询重复推送
+            // 这次点击是用户手势，readText 成功说明剪贴板授权已通过，
+            // 若共享轮询因授权失败被暂停，此时自动恢复
+            if (clipboardShareEnabled.value && connectionState.value === 'connected' && !clipboardPollTimer) {
+                startClipboardPolling();
+            }
             message.success(`已发送 ${text.length} 个字符到远程剪贴板，在远程系统里 Ctrl+V 即可粘贴`);
         }
     } catch (e) {
@@ -207,6 +229,66 @@ function sendPasteModal() {
     }
 }
 
+// ============ 剪贴板自动共享：本机 ⇄ 远程 定时双向同步 ============
+
+/**
+ * 轮询一次本机剪贴板，内容有变化就推送到远程
+ */
+async function pollLocalClipboard() {
+    if (!clipboardShareEnabled.value || connectionState.value !== 'connected') return;
+    if (!document.hasFocus()) return; // 仅窗口聚焦时读取，避免后台标签页反复抢占读取
+    let text;
+    try {
+        text = await navigator.clipboard.readText();
+    } catch (err) {
+        // 权限被拒（NotAllowedError 等）：不能中断页面功能，降级处理——
+        // 自动停止轮询并提示一次；用户点一次"粘贴"按钮（用户手势可完成授权）后会自动恢复共享
+        stopClipboardPolling();
+        clipboardShareSuspended.value = true;
+        if (!clipboardPermWarned) {
+            clipboardPermWarned = true;
+            message.warning('剪贴板读取被浏览器拒绝：点一次"粘贴"按钮完成授权后会自动恢复共享');
+        }
+        console.warn('剪贴板共享：读取本机剪贴板被拒绝，已暂停轮询', err);
+        return;
+    }
+    if (text && text !== lastPushedText && rfb && connectionState.value === 'connected') {
+        rfb.clipboardPaste(text);
+        lastPushedText = text;
+    }
+}
+
+/**
+ * 启动剪贴板共享轮询（1.5s 一次，启动时立即先尝试一次）
+ */
+function startClipboardPolling() {
+    if (clipboardPollTimer) return;
+    clipboardShareSuspended.value = false;
+    clipboardPermWarned = false;
+    pollLocalClipboard();
+    clipboardPollTimer = setInterval(pollLocalClipboard, 1500);
+}
+
+/**
+ * 停止剪贴板共享轮询（开关关闭 / 断开连接 / 组件卸载时清理）
+ */
+function stopClipboardPolling() {
+    if (clipboardPollTimer) {
+        clearInterval(clipboardPollTimer);
+        clipboardPollTimer = null;
+    }
+}
+
+// 开关切换：持久化到 localStorage，并按需启停轮询
+watch(clipboardShareEnabled, (enabled) => {
+    localStorage.setItem('vncClipboardShare', enabled ? '1' : '0');
+    if (enabled && connectionState.value === 'connected') {
+        startClipboardPolling();
+    } else {
+        stopClipboardPolling();
+    }
+});
+
 // Ctrl+V 直接粘贴：在捕获阶段拦截，避免按键被转发到远程系统
 function handleKeyDown(e) {
     if (connectionState.value !== 'connected') return;
@@ -225,6 +307,7 @@ function handlePaste(e) {
     if (!text) return;
     e.preventDefault();
     if (sendToRemoteClipboard(text)) {
+        lastPushedText = text; // 防回环：刚推送的内容不再被轮询重复推送
         message.success(`已粘贴 ${text.length} 个字符到远程剪贴板`);
     }
 }
@@ -292,6 +375,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+    stopClipboardPolling();
     disconnectVnc();
     document.removeEventListener('fullscreenchange', handleFullscreenChange);
     document.removeEventListener('keydown', handleKeyDown, true);
@@ -360,6 +444,12 @@ onUnmounted(() => {
                                 </template>
                             </a-button>
                         </a-tooltip>
+                        <a-tooltip title="开启后本机剪贴板与远程系统剪贴板自动互相同步（需浏览器授权，Chrome/Edge 支持最好）">
+                            <span style="display: inline-flex; align-items: center; gap: 4px; font-size: 13px; cursor: default;">
+                                剪贴板共享
+                                <a-switch v-model:checked="clipboardShareEnabled" size="small" />
+                            </span>
+                        </a-tooltip>
                         <a-button @click="toggleFullscreen" :disabled="connectionState !== 'connected'">
                             <template #icon>
                                 <CompressOutlined v-if="isFullscreen" />
@@ -402,6 +492,7 @@ onUnmounted(() => {
                     显示器: {{ vncStatus.display }} | VNC 端口: {{ vncStatus.port }}
                     <span v-if="vncStatus.workerCount"> | 浏览器实例: {{ vncStatus.workerCount }}</span>
                     <span v-if="connectionState === 'connected'"> | 已连接：Ctrl+V 或"粘贴"按钮可发送本地剪贴板，远程复制会自动同步到本地</span>
+                    <span v-if="connectionState === 'connected' && clipboardShareEnabled"> | 剪贴板共享: {{ clipboardShareSuspended ? '开（已暂停：点"粘贴"按钮授权后自动恢复）' : '开（自动双向同步）' }}</span>
                 </div>
             </div>
         </a-card>
