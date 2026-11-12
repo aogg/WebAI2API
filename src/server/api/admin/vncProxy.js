@@ -119,26 +119,24 @@ export async function handleVncUpgrade(req, socket, head, authToken) {
 /**
  * 编码 WebSocket 帧（服务端发送，无掩码）
  * @param {Buffer} data - 要发送的数据
- * @param {number} [opcode=0x82] - 帧类型操作码（0x82=二进制，0x81=文本），默认二进制
  * @returns {Buffer} WebSocket 帧
  */
-export function encodeWebSocketFrame(data, opcode = 0x82) {
+function encodeWebSocketFrame(data) {
     const length = data.length;
-    const firstByte = (opcode & 0x0f) | 0x80; // FIN + 操作码
     let header;
 
     if (length <= 125) {
         header = Buffer.alloc(2);
-        header[0] = firstByte;
+        header[0] = 0x82; // FIN + Binary
         header[1] = length;
     } else if (length <= 65535) {
         header = Buffer.alloc(4);
-        header[0] = firstByte;
+        header[0] = 0x82;
         header[1] = 126;
         header.writeUInt16BE(length, 2);
     } else {
         header = Buffer.alloc(10);
-        header[0] = firstByte;
+        header[0] = 0x82;
         header[1] = 127;
         header.writeBigUInt64BE(BigInt(length), 2);
     }
@@ -151,7 +149,7 @@ export function encodeWebSocketFrame(data, opcode = 0x82) {
  * @param {Buffer} buffer - 接收到的数据
  * @returns {{data: Buffer, bytesConsumed: number, opcode: number} | null}
  */
-export function decodeWebSocketFrame(buffer) {
+function decodeWebSocketFrame(buffer) {
     if (buffer.length < 2) return null;
 
     const firstByte = buffer[0];

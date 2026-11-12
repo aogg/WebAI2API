@@ -194,7 +194,6 @@ http://localhost:3000
 
 > [!TIP]
 > **CDP 远程连接**: 将配置中的 `browser.cdpEndpoint` 设为 `http://IP:9222` (或 `ws://IP:9222/devtools/browser/<id>`), 可直连一台已运行的远程浏览器 (Chromium 系) 而非本地启动 Camoufox, 适合浏览器跑在另一台机器/容器的场景。远端浏览器需以 `--remote-debugging-port=9222` (或等效方式) 开启 CDP, 详见 [config.example.yaml](config.example.yaml)。
-> CDP 模式下 WebUI 的「虚拟显示器」面板会自动切换为「CDP 远程画面」模式，实时显示远程浏览器画面（截图流），并支持远程剪贴板读写与 Worker 切换。
 
 ---
 
