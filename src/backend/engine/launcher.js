@@ -1,6 +1,6 @@
 /**
  * @fileoverview 浏览器启动与生命周期管理
- * @description 负责启动 Camoufox（Playwright 内核）、注入指纹与代理，并在进程退出时做资源清理。
+ * @description 负责启动 Camoufox（Playwright 内核）、注入指纹与代理，或通过 CDP 连接远程浏览器，并在进程退出时做资源清理。
  *              导航和预热行为由工作池负责，本模块只负责启动浏览器。
  *
  * 约定：
@@ -11,6 +11,7 @@
 import { Camoufox } from 'camoufox-js';
 import { sampleWebGL } from 'camoufox-js/dist/webgl/sample.js';
 import { FingerprintGenerator } from 'fingerprint-generator';
+import { chromium } from 'playwright-core';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -23,12 +24,30 @@ import { getBrowserProxy, cleanupProxy } from '../../utils/proxy.js';
 let globalBrowserProcess = null;
 let globalContext = null; // 替代 globalBrowser
 
+let globalCdpBrowser = null; // CDP 远程连接模式下的连接对象（仅用于断开连接，不拥有远端浏览器进程）
+
 /**
  * 清理浏览器资源和进程
  * 实现三级退出机制: Playwright close -> SIGTERM -> SIGKILL
  * @returns {Promise<void>}
  */
 export async function cleanup() {
+
+    // CDP 远程连接模式：只断开连接，绝不关闭远端 context 或任何进程
+    // 连接型 browser.close() 的语义是“清掉本连接创建的 context 并断开连接”，
+    // 不会关闭远端浏览器进程与远端已有页面（避免误伤远端用户正在使用的窗口）
+    if (globalCdpBrowser) {
+        try {
+            logger.debug('浏览器', '正在断开 CDP 远程连接...');
+            await globalCdpBrowser.close();
+            logger.debug('浏览器', '已断开 CDP 远程连接');
+        } catch (e) {
+            logger.warn('浏览器', `断开 CDP 远程连接失败: ${e.message}`);
+        } finally {
+            globalCdpBrowser = null;
+            globalContext = null;
+        }
+    }
 
     // Level 1: 通过 Playwright 协议优雅关闭 Context，保存 Profile
     if (globalContext) {
@@ -239,6 +258,162 @@ async function getPersistentFingerprint(filePath) {
 }
 
 /**
+ * CSS 性能优化注入（本地启动与 CDP 远程连接两个分支共用）
+ * context.addInitScript 在 CDP 远程连接下同样有效
+ *
+ * @param {object} context - 浏览器上下文
+ * @param {object} browserConfig - browser 配置段
+ * @param {string} markLabel - 日志标识
+ */
+async function injectPerformanceCss(context, browserConfig, markLabel) {
+    const cssInjectConfig = browserConfig.cssInject || {};
+    const cssToInject = [];
+
+    if (cssInjectConfig.animation) {
+        cssToInject.push(`
+            *, *::before, *::after {
+                /* 过渡和关键帧动画 */
+                transition: none !important;
+                animation: none !important;
+                transition-property: none !important;
+                
+                /* 平滑滚动 */
+                scroll-behavior: auto !important;
+            }
+            
+            /* transform 动画 */
+            *:not(dummy-selector) {
+                transition-duration: 0s !important;
+                animation-duration: 0s !important;
+                transition-delay: 0s !important;
+                animation-delay: 0s !important;
+            }
+        `);
+    }
+
+    if (cssInjectConfig.filter) {
+        cssToInject.push(`
+            *, *::before, *::after {
+                filter: none !important;
+                backdrop-filter: none !important;
+                box-shadow: none !important;
+                text-shadow: none !important;
+                mix-blend-mode: normal !important;
+            }
+        `);
+    }
+
+    if (cssInjectConfig.font) {
+        cssToInject.push(`
+            html, body {
+                text-rendering: optimizeSpeed !important;
+            }
+        `);
+    }
+
+    // 只有当至少一个开关启用时才进行注入，防止影响浏览器指纹
+    if (cssToInject.length > 0) {
+        const cssString = cssToInject.join('\n');
+        await context.addInitScript(`
+            (function() {
+                const style = document.createElement('style');
+                style.textContent = ${JSON.stringify(cssString)};
+                if (document.head) {
+                    document.head.appendChild(style);
+                } else {
+                    document.addEventListener('DOMContentLoaded', () => {
+                        document.head.appendChild(style);
+                    });
+                }
+            })();
+        `);
+        const enabledFeatures = [];
+        if (cssInjectConfig.animation) enabledFeatures.push('动画禁用');
+        if (cssInjectConfig.filter) enabledFeatures.push('滤镜禁用');
+        if (cssInjectConfig.font) enabledFeatures.push('字体优化');
+        logger.info('浏览器', `[${markLabel}] CSS 注入已启用: ${enabledFeatures.join(', ')}`);
+    }
+}
+
+/**
+ * 通过 CDP 端点连接一台已运行的远程浏览器（Chromium 系）
+ *
+ * 与本地启动分支的区别：
+ * - 不生成本地指纹、不构造 Camoufox 启动选项、不注入本地代理、不强制 setViewportSize
+ * - 优先复用远端默认上下文 (browser.contexts()[0])，没有才新建上下文
+ * - 退出清理只断开连接（browser.close() 对连接型浏览器不会关闭远端进程与已有页面）
+ *
+ * @param {object} browserConfig - browser 配置段
+ * @param {object} options - 附加参数
+ * @param {string} options.markLabel - 日志标识
+ * @param {string} options.cdpEndpoint - CDP 端点 (http://IP:9222 或 ws://IP:9222/devtools/browser/<id>)
+ * @param {object} [options.proxyConfig] - Worker 级代理配置（CDP 模式下不注入，仅提示）
+ * @returns {Promise<{context: object, page: object}>} 浏览器上下文和初始页面
+ */
+async function initBrowserBaseViaCDP(browserConfig, { markLabel, cdpEndpoint, proxyConfig = null }) {
+    logger.info('浏览器', `[${markLabel}] 启动浏览器实例...`);
+    logger.info('浏览器', `[${markLabel}] CDP 远程连接模式: ${cdpEndpoint} (不本地启动浏览器，指纹/Camoufox 拟人轨迹等本地专属功能不生效)`);
+
+    if (proxyConfig) {
+        logger.warn('浏览器', `[${markLabel}] CDP 远程模式下 Worker 级代理配置不生效（已跳过本地代理注入）`);
+    }
+
+    let browser;
+    try {
+        browser = await chromium.connectOverCDP(cdpEndpoint);
+    } catch (e) {
+        throw new Error(`CDP 远程连接失败 (端点: ${cdpEndpoint}): ${e.message}。请确认远端浏览器已通过 --remote-debugging-port=<端口> (或等效方式) 开启 CDP，且该端点可访问`);
+    }
+    globalCdpBrowser = browser;
+
+    // 优先复用远端已有默认上下文；远端没有任何上下文时才新建
+    let context = browser.contexts()[0];
+    if (!context) {
+        context = await browser.newContext();
+        logger.info('浏览器', `[${markLabel}] 远端无默认上下文，已创建新上下文`);
+    }
+    globalContext = context;
+
+    const existingPageCount = context.pages().length;
+    if (existingPageCount > 0) {
+        logger.info('浏览器', `[${markLabel}] CDP 远程连接已建立 (复用远端上下文, 含 ${existingPageCount} 个现有标签页)`);
+    } else {
+        logger.info('浏览器', `[${markLabel}] CDP 远程连接已建立 (复用远端上下文)`);
+    }
+
+    // 注册清理处理器（SIGINT/SIGTERM 时通过 cleanup() 断开连接）
+    registerCleanupHandlers();
+
+    // 注册断连事件（远端退出或网络断开时触发；不自动退出进程，由 Worker 决定后续行为）
+    context.on('close', async () => {
+        logger.warn('浏览器', `[${markLabel}] CDP 远程浏览器已断开连接`);
+        // 清理全局状态，但不退出进程
+        globalContext = null;
+        globalCdpBrowser = null;
+    });
+
+    // 获取或创建 Page（优先复用远端已有标签页）
+    let page;
+    const existingPages = context.pages();
+    if (existingPages.length > 0) {
+        page = existingPages[0];
+    } else {
+        page = await context.newPage();
+    }
+
+    // 注意：不强制 setViewportSize，尊重远端浏览器自身的窗口与视口设置
+
+    // CSS 性能优化注入（与本地分支共用）
+    await injectPerformanceCss(context, browserConfig, markLabel);
+
+    // 返回 context 和 page（导航、预热、cursor 初始化由工作池负责）
+    return {
+        context,
+        page
+    };
+}
+
+/**
  * 启动浏览器实例 (仅负责启动，不负责导航和预热)
  * 
  * 导航到目标页面、注册导航处理器、预热行为由工作池 (pool.js) 负责。
@@ -260,6 +435,15 @@ export async function initBrowserBase(config, options = {}) {
     // 日志标识 (优先使用实例名称)
     const markLabel = instanceName || '默认';
 
+    const browserConfig = config?.browser || {};
+
+    // CDP 远程连接模式：cdpEndpoint 非空时直连一台已运行的远程浏览器（Chromium 系），
+    // 跳过本地指纹生成 / Camoufox 启动 / 代理注入 / 强制视口等本地专属逻辑
+    const cdpEndpoint = typeof browserConfig.cdpEndpoint === 'string' ? browserConfig.cdpEndpoint.trim() : '';
+    if (cdpEndpoint) {
+        return await initBrowserBaseViaCDP(browserConfig, { markLabel, cdpEndpoint, proxyConfig });
+    }
+
     // 检测登录模式和 Xvfb 模式
     const isLoginMode = process.argv.some(arg => arg.startsWith('-login'));
     const isXvfbMode = process.env.XVFB_RUNNING === 'true';
@@ -274,8 +458,6 @@ export async function initBrowserBase(config, options = {}) {
     }
 
     logger.info('浏览器', `[${markLabel}] 启动浏览器实例...`);
-
-    const browserConfig = config?.browser || {};
 
     // 获取指纹对象（指纹文件放在对应的 userDataDir 内）
     const fingerprintPath = path.join(userDataDir, 'fingerprint.json');
@@ -354,74 +536,8 @@ export async function initBrowserBase(config, options = {}) {
     const screenHeight = myFingerprint.screen?.availHeight || 768;
     await page.setViewportSize({ width: screenWidth, height: screenHeight });
 
-    // CSS 性能优化注入
-    const cssInjectConfig = browserConfig.cssInject || {};
-    const cssToInject = [];
-
-    if (cssInjectConfig.animation) {
-        cssToInject.push(`
-            *, *::before, *::after {
-                /* 过渡和关键帧动画 */
-                transition: none !important;
-                animation: none !important;
-                transition-property: none !important;
-                
-                /* 平滑滚动 */
-                scroll-behavior: auto !important;
-            }
-            
-            /* transform 动画 */
-            *:not(dummy-selector) {
-                transition-duration: 0s !important;
-                animation-duration: 0s !important;
-                transition-delay: 0s !important;
-                animation-delay: 0s !important;
-            }
-        `);
-    }
-
-    if (cssInjectConfig.filter) {
-        cssToInject.push(`
-            *, *::before, *::after {
-                filter: none !important;
-                backdrop-filter: none !important;
-                box-shadow: none !important;
-                text-shadow: none !important;
-                mix-blend-mode: normal !important;
-            }
-        `);
-    }
-
-    if (cssInjectConfig.font) {
-        cssToInject.push(`
-            html, body {
-                text-rendering: optimizeSpeed !important;
-            }
-        `);
-    }
-
-    // 只有当至少一个开关启用时才进行注入，防止影响浏览器指纹
-    if (cssToInject.length > 0) {
-        const cssString = cssToInject.join('\n');
-        await context.addInitScript(`
-            (function() {
-                const style = document.createElement('style');
-                style.textContent = ${JSON.stringify(cssString)};
-                if (document.head) {
-                    document.head.appendChild(style);
-                } else {
-                    document.addEventListener('DOMContentLoaded', () => {
-                        document.head.appendChild(style);
-                    });
-                }
-            })();
-        `);
-        const enabledFeatures = [];
-        if (cssInjectConfig.animation) enabledFeatures.push('动画禁用');
-        if (cssInjectConfig.filter) enabledFeatures.push('滤镜禁用');
-        if (cssInjectConfig.font) enabledFeatures.push('字体优化');
-        logger.info('浏览器', `[${markLabel}] CSS 注入已启用: ${enabledFeatures.join(', ')}`);
-    }
+    // CSS 性能优化注入（本地与 CDP 远程连接分支共用）
+    await injectPerformanceCss(context, browserConfig, markLabel);
 
     // 返回 context 和 page（导航、预热、cursor 初始化由工作池负责）
     return {

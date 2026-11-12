@@ -258,6 +258,11 @@ export function loadConfig() {
         config.browser.humanizeCursor = true;
     }
 
+    // CDP 远程连接端点：默认空字符串 = 走本地启动 Camoufox 分支
+    if (config.browser.cdpEndpoint === undefined) {
+        config.browser.cdpEndpoint = '';
+    }
+
     // 设置 Pool 配置默认值
     if (!config.backend) config.backend = {};
     if (!config.backend.pool) config.backend.pool = {};

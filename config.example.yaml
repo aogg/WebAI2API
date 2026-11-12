@@ -159,6 +159,13 @@ queue:
   imageLimit: 5
 
 browser:
+  # CDP 远程连接端点 (留空 = 本地启动 Camoufox 浏览器)
+  # 填写后不再本地启动浏览器, 而是通过 CDP 直接连接一台已运行的远程浏览器 (Chromium 系)
+  # 支持 http://IP:9222 或 ws://IP:9222/devtools/browser/<id> 两种端点写法
+  # ⚠️ 远端浏览器需以 --remote-debugging-port=9222 (或等效方式) 开启 CDP
+  # ⚠️ 远程模式下本地的指纹伪装/拟人轨迹/代理注入等 Camoufox 专属功能不生效
+  cdpEndpoint: ""
+
   # 浏览器可执行文件路径 (留空则使用默认的)
   # 非必要不建议修改，否则你要处理很多额外依赖
   # Windows系统示例 "C:\\camoufox\\camoufox.exe"

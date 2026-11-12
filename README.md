@@ -192,6 +192,9 @@ http://localhost:3000
 > 
 > **建议**: 为降低风控, **强烈建议长期保持非无头模式运行**(或使用虚拟显示器 Xvfb)。
 
+> [!TIP]
+> **CDP 远程连接**: 将配置中的 `browser.cdpEndpoint` 设为 `http://IP:9222` (或 `ws://IP:9222/devtools/browser/<id>`), 可直连一台已运行的远程浏览器 (Chromium 系) 而非本地启动 Camoufox, 适合浏览器跑在另一台机器/容器的场景。远端浏览器需以 `--remote-debugging-port=9222` (或等效方式) 开启 CDP, 详见 [config.example.yaml](config.example.yaml)。
+
 ---
 
 ## 🔌 API 接口

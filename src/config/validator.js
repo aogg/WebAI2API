@@ -84,6 +84,11 @@ export function validateBrowserConfig(data) {
         errors.push('path 必须是字符串');
     }
 
+    // CDP 远程连接端点校验（可选，字符串；留空表示本地启动 Camoufox，填写表示远程连接）
+    if (data.cdpEndpoint !== undefined && typeof data.cdpEndpoint !== 'string') {
+        errors.push('cdpEndpoint 必须是字符串');
+    }
+
     // Headless 校验
     if (data.headless !== undefined && typeof data.headless !== 'boolean') {
         errors.push('headless 必须是布尔值');

@@ -195,6 +195,9 @@ http://localhost:3000
 > 
 > **Recommendation**: To reduce risk, **it is strongly recommended to run in non-headless mode for the long term** (or use virtual display Xvfb).
 
+> [!TIP]
+> **CDP Remote Connection**: Set `browser.cdpEndpoint` in the config to `http://IP:9222` (or `ws://IP:9222/devtools/browser/<id>`) to connect directly to an already-running remote browser (Chromium-based) instead of launching Camoufox locally. The remote browser must have CDP enabled via `--remote-debugging-port=9222` (or equivalent). See [config.example.yaml](config.example.yaml) for details.
+
 ---
 
 ## 🔌 API Reference
