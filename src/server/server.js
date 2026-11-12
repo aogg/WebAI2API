@@ -163,14 +163,20 @@ async function startServer() {
     // 创建并启动 HTTP 服务器
     const server = http.createServer(handleRequest);
 
-    // 处理 WebSocket 升级请求（VNC 代理）
+    // 处理 WebSocket 升级请求（VNC 代理 / CDP 远程画面推流）
     server.on('upgrade', async (req, socket, head) => {
         const url = new URL(req.url, `http://${req.headers.host}`);
 
-        // 只处理 /admin/vnc 路径
+        // /admin/vnc：本地模式虚拟显示器（Xvfb + x11vnc 代理）
         if (url.pathname === '/admin/vnc') {
             const { handleVncUpgrade } = await import('./api/admin/vncProxy.js');
             await handleVncUpgrade(req, socket, head, AUTH_TOKEN);
+        } else if (url.pathname === '/admin/screen') {
+            // /admin/screen：CDP 远程连接模式下的远程浏览器画面截图流
+            const { handleScreenUpgrade } = await import('./api/admin/screenStream.js');
+            await handleScreenUpgrade(req, socket, head, AUTH_TOKEN, {
+                getPoolManager: () => queueManager?.getPoolContext?.()?.poolManager || null
+            });
         } else {
             socket.destroy();
         }

@@ -65,6 +65,41 @@ async function readBody(req) {
 }
 
 /**
+ * 掩码 CDP 端点：只保留协议与 host:port，隐藏路径与凭据
+ * @param {string} endpoint - 原始端点（http://IP:9222 或 ws://IP:9222/devtools/browser/<id>）
+ * @returns {string} 形如 ws://IP:9222 的安全展示串，无法解析时返回占位符
+ */
+function maskCdpEndpoint(endpoint) {
+    try {
+        const url = new URL(endpoint);
+        const protocol = url.protocol.replace(/:$/, '');
+        const port = url.port || (url.protocol === 'wss:' || url.protocol === 'https:' ? '443' : '80');
+        return `${protocol}://${url.hostname}:${port}`;
+    } catch (e) {
+        // 端点不是标准 URL（无法解析）时不展示任何内容，避免泄露路径或凭据
+        logger.warn('管理器', `CDP 端点无法解析，状态接口将以隐藏形式展示: ${e.message}`);
+        return '(已隐藏)';
+    }
+}
+
+/**
+ * 已授权剪贴板权限的浏览器上下文集合（按 context 记忆，避免每次请求重复授权）
+ * @type {WeakSet<object>}
+ */
+const clipboardPermContexts = new WeakSet();
+
+/**
+ * 确保 page 所在上下文具有剪贴板读写权限（CDP 远程上下文需要显式授权）
+ * @param {object} page - Playwright Page 对象
+ */
+async function ensureClipboardPermission(page) {
+    const context = page.context();
+    if (clipboardPermContexts.has(context)) return;
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    clipboardPermContexts.add(context);
+}
+
+/**
  * 创建 Admin 路由处理器
  * @param {object} context - 路由上下文
  * @param {object} context.config - 完整配置对象
@@ -177,6 +212,140 @@ export function createAdminRouter(context) {
                         display: '',
                         xvfbMode: false
                     });
+                }
+                return;
+            }
+
+            // ==================== CDP 远程画面 ====================
+
+            // GET /admin/screen/status - CDP 远程画面状态
+            if (method === 'GET' && pathname === '/screen/status') {
+                const browserInfo = getBrowserConfig();
+                const cdpEndpoint = (browserInfo.cdpEndpoint || '').trim();
+
+                // 非 CDP 模式：本地启动浏览器，虚拟显示器走 VNC 流程
+                if (!cdpEndpoint) {
+                    sendJson(res, 200, { mode: 'local', enabled: false });
+                    return;
+                }
+
+                const poolContext = queueManager?.getPoolContext?.();
+                const poolManager = poolContext?.poolManager;
+
+                sendJson(res, 200, {
+                    mode: 'cdp',
+                    enabled: !!(poolManager && poolManager.initialized),
+                    endpoint: maskCdpEndpoint(cdpEndpoint),
+                    workers: poolManager?.initialized ? poolManager.getScreenWorkersStatus() : []
+                });
+                return;
+            }
+
+            // POST /admin/screen/clipboard - 写远程剪贴板（仅 CDP 模式可用）
+            if (method === 'POST' && pathname === '/screen/clipboard') {
+                const browserInfo = getBrowserConfig();
+                if (!(browserInfo.cdpEndpoint || '').trim()) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: '远程剪贴板仅在 CDP 远程连接模式（browser.cdpEndpoint 非空）下可用',
+                        status: 400
+                    });
+                    return;
+                }
+
+                const poolContext = queueManager?.getPoolContext?.();
+                const poolManager = poolContext?.poolManager;
+                if (!poolManager || !poolManager.initialized) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: '工作池尚未初始化（可能处于安全模式），无法操作远程剪贴板',
+                        status: 503
+                    });
+                    return;
+                }
+
+                const body = await readBody(req);
+                const text = typeof body.text === 'string' ? body.text : '';
+                const target = poolManager.getPageForScreen(body.worker || null);
+                if (!target) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: `Worker 不存在或页面未就绪${body.worker ? `: ${body.worker}` : ''}`,
+                        status: 404
+                    });
+                    return;
+                }
+
+                try {
+                    await ensureClipboardPermission(target.page);
+                    await target.page.evaluate(t => navigator.clipboard.writeText(t), text);
+                    logger.info('管理器', `[${target.name}] 已写入远程剪贴板 (${text.length} 字符)`);
+                    sendJson(res, 200, { success: true, ok: true, fallback: false });
+                } catch (e) {
+                    // 剪贴板 API 不可用（远端 Chromium 不支持授权等）：降级为直接插入文本到焦点元素
+                    logger.warn('管理器', `[${target.name}] 远程剪贴板写入失败，降级为插入文本: ${e.message}`);
+                    try {
+                        await target.page.keyboard.insertText(text);
+                        sendJson(res, 200, {
+                            success: true,
+                            ok: true,
+                            fallback: true,
+                            message: '远程剪贴板不可用，已直接插入文本到焦点元素（非剪贴板）'
+                        });
+                    } catch (e2) {
+                        sendApiError(res, {
+                            code: ERROR_CODES.INTERNAL_ERROR,
+                            message: `写入远程剪贴板失败: ${e.message}；降级插入文本也失败: ${e2.message}`
+                        });
+                    }
+                }
+                return;
+            }
+
+            // GET /admin/screen/clipboard?worker= - 读远程剪贴板（仅 CDP 模式可用）
+            if (method === 'GET' && pathname === '/screen/clipboard') {
+                const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+                const workerParam = requestUrl.searchParams.get('worker');
+
+                const browserInfo = getBrowserConfig();
+                if (!(browserInfo.cdpEndpoint || '').trim()) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: '远程剪贴板仅在 CDP 远程连接模式（browser.cdpEndpoint 非空）下可用',
+                        status: 400
+                    });
+                    return;
+                }
+
+                const poolContext = queueManager?.getPoolContext?.();
+                const poolManager = poolContext?.poolManager;
+                if (!poolManager || !poolManager.initialized) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: '工作池尚未初始化（可能处于安全模式），无法读取远程剪贴板',
+                        status: 503
+                    });
+                    return;
+                }
+
+                const target = poolManager.getPageForScreen(workerParam || null);
+                if (!target) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INTERNAL_ERROR,
+                        message: `Worker 不存在或页面未就绪${workerParam ? `: ${workerParam}` : ''}`,
+                        status: 404
+                    });
+                    return;
+                }
+
+                try {
+                    await ensureClipboardPermission(target.page);
+                    const text = await target.page.evaluate(() => navigator.clipboard.readText());
+                    sendJson(res, 200, { success: true, ok: true, text: typeof text === 'string' ? text : '' });
+                } catch (e) {
+                    // 读取失败时返回 ok:false，由前端自行降级（不作为服务端错误处理）
+                    logger.warn('管理器', `[${target.name}] 读取远程剪贴板失败: ${e.message}`);
+                    sendJson(res, 200, { success: false, ok: false, message: e.message });
                 }
                 return;
             }

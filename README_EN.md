@@ -197,6 +197,7 @@ http://localhost:3000
 
 > [!TIP]
 > **CDP Remote Connection**: Set `browser.cdpEndpoint` in the config to `http://IP:9222` (or `ws://IP:9222/devtools/browser/<id>`) to connect directly to an already-running remote browser (Chromium-based) instead of launching Camoufox locally. The remote browser must have CDP enabled via `--remote-debugging-port=9222` (or equivalent). See [config.example.yaml](config.example.yaml) for details.
+> In CDP mode, the "Virtual Display" panel in the WebUI automatically switches to "CDP Remote Screen" mode, showing the remote browser's screen in real time (screenshot stream), with remote clipboard read/write and worker switching support.
 
 ---
 

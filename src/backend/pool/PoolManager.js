@@ -392,4 +392,39 @@ export class PoolManager {
     getFirstPage() {
         return this.workers[0]?.page || null;
     }
+
+    /**
+     * 获取指定 Worker 的当前页面（只读访问器，供 CDP 远程画面推流等场景使用）
+     *
+     * 每次调用都实时解析 worker.page —— Worker 断线重连/标签页重建后 page 引用会变化，
+     * 调用方每帧都应重新调用本方法，绝不能缓存返回的 page。
+     *
+     * @param {string|null} [workerName=null] - Worker 名称；缺省时取第一个画面可用的 Worker
+     * @returns {{page: object, name: string, type: string} | null} 页面信息，Worker 不存在或页面不可用时返回 null
+     */
+    getPageForScreen(workerName = null) {
+        let worker;
+        if (workerName) {
+            worker = this.workers.find(w => w.name === workerName);
+            if (!worker) return null;
+        } else {
+            worker = this.workers.find(w => w.initialized && w.page && !w.page.isClosed?.()) || null;
+            if (!worker) return null;
+        }
+
+        if (!worker.initialized || !worker.page || worker.page.isClosed?.()) return null;
+        return { page: worker.page, name: worker.name, type: worker.type };
+    }
+
+    /**
+     * 获取所有 Worker 的画面可用状态（只读，供 Admin API 展示）
+     * @returns {Array<{name: string, type: string, connected: boolean}>}
+     */
+    getScreenWorkersStatus() {
+        return this.workers.map(w => ({
+            name: w.name,
+            type: w.type,
+            connected: !!(w.initialized && w.page && !w.page.isClosed?.())
+        }));
+    }
 }

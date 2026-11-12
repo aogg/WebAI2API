@@ -84,6 +84,8 @@ export function getBrowserConfig() {
     const cssInject = browser.cssInject || {};
 
     return {
+        // CDP 远程连接端点（非空 = CDP 远程模式，供虚拟显示器等功能判断运行模式）
+        cdpEndpoint: browser.cdpEndpoint || '',
         path: browser.path || '',
         headless: browser.headless || false,
         fission: browser.fission !== false, // 默认 true
