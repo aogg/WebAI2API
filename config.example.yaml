@@ -166,6 +166,17 @@ browser:
   # ⚠️ 远程模式下本地的指纹伪装/拟人轨迹/代理注入等 Camoufox 专属功能不生效
   cdpEndpoint: ""
 
+  # Camoufox 远程服务器端点 (留空 = 本地启动 Camoufox 浏览器)
+  # 填写后不再本地启动浏览器, 而是通过 Playwright connect 连接一台已运行的 Camoufox 官方远程服务器 (Juggler 协议, 不是 CDP)
+  # 远端需先启动服务: python -m camoufox server (或代码调用 launch_server(...)), 启动后输出 ws://0.0.0.0:1234/camoufox
+  # 示例: ws://192.168.1.100:1234/camoufox
+  # ⚠️ 与 cdpEndpoint 互斥, 两者只能二选一
+  # ⚠️ 实验特性: 底层调用 Playwright 未公开内部方法, 版本升级易崩, 建议锁定 playwright-core 版本
+  # ⚠️ Juggler 协议不是 CDP: 没有 http://IP:9222/json 调试页, 不能复用 CDP 工具链
+  # ℹ️ 每次 connect 都会拿到独立的浏览器实例 (不是连接池, 本项目每个 Worker 各自 connect 一个即可)
+  # ℹ️ 服务端建议 headless="virtual" (Xvfb 虚拟显示) 指纹更强; 代理/GeoIP 由远端服务端负责, 本地代理配置在该模式下不生效
+  camoufoxEndpoint: ""
+
   # 浏览器可执行文件路径 (留空则使用默认的)
   # 非必要不建议修改，否则你要处理很多额外依赖
   # Windows系统示例 "C:\\camoufox\\camoufox.exe"

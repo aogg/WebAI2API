@@ -198,6 +198,9 @@ http://localhost:3000
 > [!TIP]
 > **CDP Remote Connection**: Set `browser.cdpEndpoint` in the config to `http://IP:9222` (or `ws://IP:9222/devtools/browser/<id>`) to connect directly to an already-running remote browser (Chromium-based) instead of launching Camoufox locally. The remote browser must have CDP enabled via `--remote-debugging-port=9222` (or equivalent). See [config.example.yaml](config.example.yaml) for details.
 
+> [!TIP]
+> **Camoufox Remote Server Connection**: Set `browser.camoufoxEndpoint` in the config to the WebSocket address of an official Camoufox remote server (e.g. `ws://192.168.1.100:1234/camoufox`) to connect via Playwright connect (`firefox.connect()`) instead of launching the browser locally. Start the server first with `python -m camoufox server` (`headless="virtual"` i.e. Xvfb virtual display + `geoip=True` recommended for stronger fingerprints). Notes: this mode speaks the Juggler protocol, not CDP (no `http://IP:9222/json` debug page); it is mutually exclusive with `browser.cdpEndpoint` (choose only one); it is experimental, so pinning the playwright-core version is recommended; every connect gets an independent browser instance, one per Worker in this project. See [config.example.yaml](config.example.yaml) for details.
+
 ---
 
 ## 🔌 API Reference

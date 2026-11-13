@@ -89,6 +89,23 @@ export function validateBrowserConfig(data) {
         errors.push('cdpEndpoint 必须是字符串');
     }
 
+    // Camoufox 远程服务器端点校验（可选，字符串；留空表示本地启动 Camoufox，填写表示 Playwright connect 连接）
+    if (data.camoufoxEndpoint !== undefined && typeof data.camoufoxEndpoint !== 'string') {
+        errors.push('camoufoxEndpoint 必须是字符串');
+    }
+
+    // cdpEndpoint 与 camoufoxEndpoint 互斥：两者同时配置时报错（只能二选一）
+    const hasCdpEndpoint = typeof data.cdpEndpoint === 'string' && data.cdpEndpoint.trim() !== '';
+    const hasCamoufoxEndpoint = typeof data.camoufoxEndpoint === 'string' && data.camoufoxEndpoint.trim() !== '';
+    if (hasCdpEndpoint && hasCamoufoxEndpoint) {
+        errors.push('cdpEndpoint 与 camoufoxEndpoint 互斥，只能二选一，请只保留其中一个');
+    }
+
+    // Camoufox 远程服务器端点格式校验：必须以 ws:// 或 wss:// 开头
+    if (hasCamoufoxEndpoint && !/^wss?:\/\//.test(data.camoufoxEndpoint.trim())) {
+        errors.push('camoufoxEndpoint 必须以 ws:// 或 wss:// 开头');
+    }
+
     // Headless 校验
     if (data.headless !== undefined && typeof data.headless !== 'boolean') {
         errors.push('headless 必须是布尔值');

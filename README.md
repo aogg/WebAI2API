@@ -195,6 +195,9 @@ http://localhost:3000
 > [!TIP]
 > **CDP 远程连接**: 将配置中的 `browser.cdpEndpoint` 设为 `http://IP:9222` (或 `ws://IP:9222/devtools/browser/<id>`), 可直连一台已运行的远程浏览器 (Chromium 系) 而非本地启动 Camoufox, 适合浏览器跑在另一台机器/容器的场景。远端浏览器需以 `--remote-debugging-port=9222` (或等效方式) 开启 CDP, 详见 [config.example.yaml](config.example.yaml)。
 
+> [!TIP]
+> **Camoufox 远程服务器连接**: 将配置中的 `browser.camoufoxEndpoint` 设为 Camoufox 官方远程服务器的 WebSocket 地址 (如 `ws://192.168.1.100:1234/camoufox`), 可通过 Playwright connect (`firefox.connect()`) 直连远端而本地不启动浏览器。远端需先运行 `python -m camoufox server` (建议 `headless="virtual"` 即 Xvfb 虚拟显示 + `geoip=True`, 指纹更强)。注意: 该模式基于 Juggler 协议而非 CDP (没有 `http://IP:9222/json` 调试页); 与 `browser.cdpEndpoint` 互斥, 只能二选一; 属实验特性, 建议锁定 playwright-core 版本; 每次 connect 都会拿到独立浏览器实例, 本项目每个 Worker 各自连接一个。详见 [config.example.yaml](config.example.yaml)。
+
 ---
 
 ## 🔌 API 接口

@@ -1,6 +1,6 @@
 /**
  * @fileoverview 浏览器启动与生命周期管理
- * @description 负责启动 Camoufox（Playwright 内核）、注入指纹与代理，或通过 CDP 连接远程浏览器，并在进程退出时做资源清理。
+ * @description 负责启动 Camoufox（Playwright 内核）、注入指纹与代理，或通过 CDP / Playwright connect 连接远程浏览器（CDP / Camoufox Remote Server），并在进程退出时做资源清理。
  *              导航和预热行为由工作池负责，本模块只负责启动浏览器。
  *
  * 约定：
@@ -11,7 +11,7 @@
 import { Camoufox } from 'camoufox-js';
 import { sampleWebGL } from 'camoufox-js/dist/webgl/sample.js';
 import { FingerprintGenerator } from 'fingerprint-generator';
-import { chromium } from 'playwright-core';
+import { chromium, firefox } from 'playwright-core';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -25,6 +25,7 @@ let globalBrowserProcess = null;
 let globalContext = null; // 替代 globalBrowser
 
 let globalCdpBrowser = null; // CDP 远程连接模式下的连接对象（仅用于断开连接，不拥有远端浏览器进程）
+let globalCamoufoxServerBrowser = null; // Camoufox 远程服务器连接模式下的连接对象（仅用于断开连接，不拥有远端浏览器进程）
 
 /**
  * 清理浏览器资源和进程
@@ -45,6 +46,22 @@ export async function cleanup() {
             logger.warn('浏览器', `断开 CDP 远程连接失败: ${e.message}`);
         } finally {
             globalCdpBrowser = null;
+            globalContext = null;
+        }
+    }
+
+    // Camoufox 远程服务器连接模式：只断开连接，绝不关闭远端 server 或任何进程
+    // 连接型 browser.close() 的语义是“断开连接并清理本连接创建的 context”，
+    // 不会关闭远端 camoufox server 进程与远端已有页面
+    if (globalCamoufoxServerBrowser) {
+        try {
+            logger.debug('浏览器', '正在断开 Camoufox 远程服务器连接...');
+            await globalCamoufoxServerBrowser.close();
+            logger.debug('浏览器', '已断开 Camoufox 远程服务器连接');
+        } catch (e) {
+            logger.warn('浏览器', `断开 Camoufox 远程服务器连接失败: ${e.message}`);
+        } finally {
+            globalCamoufoxServerBrowser = null;
             globalContext = null;
         }
     }
@@ -258,8 +275,8 @@ async function getPersistentFingerprint(filePath) {
 }
 
 /**
- * CSS 性能优化注入（本地启动与 CDP 远程连接两个分支共用）
- * context.addInitScript 在 CDP 远程连接下同样有效
+ * CSS 性能优化注入（本地启动、CDP 远程连接、Camoufox 远程服务器连接三个分支共用）
+ * context.addInitScript 在 CDP / Camoufox 远程连接下同样有效
  *
  * @param {object} context - 浏览器上下文
  * @param {object} browserConfig - browser 配置段
@@ -414,6 +431,89 @@ async function initBrowserBaseViaCDP(browserConfig, { markLabel, cdpEndpoint, pr
 }
 
 /**
+ * 连接一台已运行的 Camoufox 官方远程服务器（Camoufox Remote Server）
+ *
+ * 端点为 Playwright 兼容 WebSocket（Juggler 协议，不是 CDP），
+ * 使用 playwright-core 的 firefox.connect() 连接。
+ *
+ * 与本地启动分支的区别：
+ * - 不生成本地指纹、不构造 Camoufox 启动选项、不注入本地代理、不强制 setViewportSize
+ * - 代理 / GeoIP 由远端服务端负责，Worker 级代理配置在该模式下不生效
+ * - 与 CDP 分支一致：优先复用远端已有上下文 (browser.contexts()[0])，没有才新建上下文
+ *   （官方远程服务器每次 connect 都会拿到独立浏览器实例，通常此处走新建分支）
+ * - 退出清理只断开连接（browser.close() 对连接型浏览器不会关闭远端 server 进程与已有页面）
+ *
+ * @param {object} browserConfig - browser 配置段
+ * @param {object} options - 附加参数
+ * @param {string} options.markLabel - 日志标识
+ * @param {string} options.camoufoxEndpoint - Camoufox 远程服务器端点 (ws://IP:1234/camoufox 或 wss://...)
+ * @param {object} [options.proxyConfig] - Worker 级代理配置（该模式下不生效，仅提示）
+ * @returns {Promise<{context: object, page: object}>} 浏览器上下文和初始页面
+ */
+async function initBrowserBaseViaCamoufoxServer(browserConfig, { markLabel, camoufoxEndpoint, proxyConfig = null }) {
+    logger.info('浏览器', `[${markLabel}] 启动浏览器实例...`);
+    logger.info('浏览器', `[${markLabel}] Camoufox 远程服务器连接模式: ${camoufoxEndpoint} (不本地启动浏览器，指纹/Camoufox 拟人轨迹等本地专属功能不生效)`);
+
+    if (proxyConfig) {
+        logger.warn('浏览器', `[${markLabel}] Camoufox 远程服务器模式下 Worker 级代理配置不生效（代理/GeoIP 由远端服务端负责，已跳过本地代理注入）`);
+    }
+
+    let browser;
+    try {
+        browser = await firefox.connect(camoufoxEndpoint);
+    } catch (e) {
+        throw new Error(`Camoufox 远程服务器连接失败 (端点: ${camoufoxEndpoint}): ${e.message}。请确认远端已启动 Camoufox 远程服务器 (python -m camoufox server 或 launch_server(port=..., ws_path="camoufox", ...))，且该端点可访问`);
+    }
+    globalCamoufoxServerBrowser = browser;
+
+    // 与 CDP 分支一致：优先复用远端已有上下文；远端没有任何上下文时才新建
+    let context = browser.contexts()[0];
+    if (!context) {
+        context = await browser.newContext();
+        logger.info('浏览器', `[${markLabel}] 远端无默认上下文，已创建新上下文`);
+    }
+    globalContext = context;
+
+    const existingPageCount = context.pages().length;
+    if (existingPageCount > 0) {
+        logger.info('浏览器', `[${markLabel}] Camoufox 远程服务器连接已建立 (复用远端上下文, 含 ${existingPageCount} 个现有标签页)`);
+    } else {
+        logger.info('浏览器', `[${markLabel}] Camoufox 远程服务器连接已建立 (复用远端上下文)`);
+    }
+
+    // 注册清理处理器（SIGINT/SIGTERM 时通过 cleanup() 断开连接）
+    registerCleanupHandlers();
+
+    // 注册断连事件（远端退出或网络断开时触发；不自动退出进程，由 Worker 决定后续行为）
+    context.on('close', async () => {
+        logger.warn('浏览器', `[${markLabel}] Camoufox 远程服务器已断开连接`);
+        // 清理全局状态，但不退出进程
+        globalContext = null;
+        globalCamoufoxServerBrowser = null;
+    });
+
+    // 获取或创建 Page（优先复用远端已有标签页）
+    let page;
+    const existingPages = context.pages();
+    if (existingPages.length > 0) {
+        page = existingPages[0];
+    } else {
+        page = await context.newPage();
+    }
+
+    // 注意：不强制 setViewportSize，尊重远端浏览器自身的窗口与视口设置
+
+    // CSS 性能优化注入（与本地启动、CDP 远程连接分支共用）
+    await injectPerformanceCss(context, browserConfig, markLabel);
+
+    // 返回 context 和 page（导航、预热、cursor 初始化由工作池负责）
+    return {
+        context,
+        page
+    };
+}
+
+/**
  * 启动浏览器实例 (仅负责启动，不负责导航和预热)
  * 
  * 导航到目标页面、注册导航处理器、预热行为由工作池 (pool.js) 负责。
@@ -442,6 +542,13 @@ export async function initBrowserBase(config, options = {}) {
     const cdpEndpoint = typeof browserConfig.cdpEndpoint === 'string' ? browserConfig.cdpEndpoint.trim() : '';
     if (cdpEndpoint) {
         return await initBrowserBaseViaCDP(browserConfig, { markLabel, cdpEndpoint, proxyConfig });
+    }
+
+    // Camoufox 远程服务器连接模式：camoufoxEndpoint 非空时通过 Playwright connect 连接
+    // Camoufox 官方远程服务器（Juggler 协议，非 CDP；校验层保证与 cdpEndpoint 互斥）
+    const camoufoxEndpoint = typeof browserConfig.camoufoxEndpoint === 'string' ? browserConfig.camoufoxEndpoint.trim() : '';
+    if (camoufoxEndpoint) {
+        return await initBrowserBaseViaCamoufoxServer(browserConfig, { markLabel, camoufoxEndpoint, proxyConfig });
     }
 
     // 检测登录模式和 Xvfb 模式
@@ -536,7 +643,7 @@ export async function initBrowserBase(config, options = {}) {
     const screenHeight = myFingerprint.screen?.availHeight || 768;
     await page.setViewportSize({ width: screenWidth, height: screenHeight });
 
-    // CSS 性能优化注入（本地与 CDP 远程连接分支共用）
+    // CSS 性能优化注入（本地启动与远程连接分支共用）
     await injectPerformanceCss(context, browserConfig, markLabel);
 
     // 返回 context 和 page（导航、预热、cursor 初始化由工作池负责）

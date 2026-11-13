@@ -8,6 +8,14 @@
   - 进程退出/清理时仅断开 CDP 连接，不关闭远端浏览器进程与远端已有页面；断连时记录日志并交由 Worker 自动重连
   - 连接失败时抛出携带端点信息的明确错误提示
 
+- **浏览器 · Camoufox 远程服务器连接**
+  - 新增 `browser.camoufoxEndpoint` 配置：留空=本地启动 Camoufox（行为不变）；填写后不再本地启动浏览器，改为通过 Playwright `firefox.connect()` 连接 Camoufox 官方远程服务器（WebSocket / Juggler 协议，非 CDP），示例 `ws://192.168.1.100:1234/camoufox`
+  - 远端服务先运行 `python -m camoufox server`（或 `launch_server(...)`），建议服务端 `headless="virtual"`（Xvfb 虚拟显示）指纹更强
+  - 与 `browser.cdpEndpoint` 互斥（校验层强制二选一）；`camoufoxEndpoint` 必须以 `ws://` 或 `wss://` 开头
+  - 远程模式自动跳过本地专属逻辑（指纹生成、Camoufox 启动参数、代理注入、强制视口），CSS 性能优化注入继续生效；Worker 级代理不生效（代理/GeoIP 由远端服务端负责）
+  - 每次 connect 拿到独立浏览器实例（非连接池），每个 Worker 各自连接；清理时仅断开本连接，不关闭远端服务与已有页面
+  - 实验特性：底层调用 Playwright 未公开内部方法，建议锁定 playwright-core 版本；Juggler 非 CDP，没有 `http://IP:9222/json` 调试页，不能复用 CDP 工具链
+
 ## [3.7.0] - 2026-11-07
 
 ### ✨ Added
